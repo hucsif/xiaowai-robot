@@ -8,8 +8,8 @@
  * 若 SSID 留空 → 开放热点（SSID=设备 ID，无密码），http://192.168.4.1/ 配网；NVS 已存凭证优先。
  * WS host 留空 → 禁用内置 WebSocket；可在配网页添加自定义云服务器。
  */
-#define WIFI_DEFAULT_SSID "deskbot_wifi"
-#define WIFI_DEFAULT_PASSWORD "hello2026"
+#define WIFI_DEFAULT_SSID "序同科技"
+#define WIFI_DEFAULT_PASSWORD "xutongkeji"
 
 /** 开机 AP 配网窗口（ms）编译期兜底；运行时以 NVS 为准（默认 20s，5–60s 可配）。 */
 #ifndef DESKBOT_AP_OFFER_TIMEOUT_MS
@@ -19,7 +19,7 @@
 /** 音频统一采样率（mic/speaker/AEC 共用）。 */
 #define SAMPLE_RATE 16000
 
-#define DESKBOT_WS_HOST "39.107.38.241"
+#define DESKBOT_WS_HOST "192.168.3.206"
 // #define DESKBOT_WS_HOST "39.107.38.241"
 #define DESKBOT_WS_PORT 9000
 
@@ -29,6 +29,22 @@
 static inline bool deskbot_ws_configured(void) {
   return DESKBOT_WS_HOST[0] != '\0';
 }
+
+/* ========== 硬件裁剪开关（自制板按实际硬件置 0/1）==========
+ * 参考板 Deskbot v2 全配：摄像头 + 双舵机(X/Y)。
+ * 自制板若缺某模块，置 0 即可安全跳过其初始化/任务/写引脚，
+ * 避免启动时相机探测耗时、GDMA 干扰 I2S，以及空引脚上输出 PWM。
+ */
+#ifndef DESKBOT_HAS_CAMERA
+#define DESKBOT_HAS_CAMERA 0
+#endif
+#ifndef DESKBOT_HAS_SERVO_Y
+#define DESKBOT_HAS_SERVO_Y 0
+#endif
+/* 开机自检：水平舵机(X) 0°→180° 慢扫 + 喇叭 1kHz 哔两声。接线验证用，测通后置 0 关闭。 */
+#ifndef DESKBOT_HW_SELF_TEST
+#define DESKBOT_HW_SELF_TEST 0
+#endif
 
 /* ========== 硬件接线（Deskbot v2 自研板，已从 Seeed XIAO ESP32S3 Sense 移植）==========
  * 引脚表来源：open-desk-bot-v2/hardware 固件 DESKBOT_BOARD_V2=1 分支（经 app.log 实机验证）。

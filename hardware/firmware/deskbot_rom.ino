@@ -1,5 +1,7 @@
 // Deskbot — XIAO ESP32S3 Sense：摄像头 + pb + 音频 + 显示屏 + 舵机
 #include <WiFi.h>
+#include <math.h>
+#include <stdlib.h>
 #include "display_panel.h"
 #include "camera.h"
 #include "deskbot_config.h"
@@ -33,6 +35,63 @@ static void on_wifi_link_up() {
   ws_transport_on_link_up();
 }
 
+#if DESKBOT_HW_SELF_TEST
+/* ---- 开机自检：水平舵机(X) 慢扫 + 喇叭 1kHz 哔两声。测完把 deskbot_config.h 里
+ * DESKBOT_HW_SELF_TEST 置 0 关闭。 ---- */
+static void run_hardware_self_test() {
+  log_warn("[SELFTEST] begin: servo X GPIO%d sweep + speaker beep", (int)DESKBOT_ROM_X_PIN);
+
+  /* 1) 水平舵机：0°→180°→0° 慢扫，最后回中 */
+  for (int deg = 0; deg <= 180; deg += 10) { servo_x.write(deg); delay(80); }
+  delay(300);
+  for (int deg = 180; deg >= 0; deg -= 10) { servo_x.write(deg); delay(80); }
+  delay(300);
+  servo_x.write(X_CENTER);
+  delay(300);
+  log_warn("[SELFTEST] servo X done, centered at %d", X_CENTER);
+
+  /* 2) 喇叭：1kHz 正弦 0.5s ×2 */
+  const uint32_t sr = SAMPLE_RATE;
+  const size_t beep_samples = (size_t)(sr * 500u / 1000u);
+  const float amp = 0.35f * 32767.0f;
+  for (int k = 0; k < 2; ++k) {
+    int16_t* pcm = (int16_t*)malloc(beep_samples * sizeof(int16_t));
+    if (!pcm) { log_error("[SELFTEST] pcm alloc failed"); return; }
+    for (size_t i = 0; i < beep_samples; ++i) {
+      const float t = (float)i / (float)sr;
+      pcm[i] = (int16_t)(amp * sinf(2.0f * 3.14159265f * 1000.0f * t));
+    }
+    log_warn("[SELFTEST] beep %d/2", k + 1);
+    if (!speaker_stream_pcm16_begin(sr, 1)) { log_error("[SELFTEST] begin fail"); free(pcm); return; }
+    if (!speaker_stream_pcm16_chunk(pcm, beep_samples, 0)) { log_error("[SELFTEST] chunk fail"); return; }
+    if (!speaker_stream_pcm16_end(1)) { log_error("[SELFTEST] end fail"); }
+    delay(700);
+  }
+
+  /* 3) 显示屏：三原色 R/G/B 各 1s，最后回黑 */
+  log_warn("[SELFTEST] display RGB");
+  const uint16_t rgb[3] = {DESKBOT_DISPLAY_COLOR_RED,
+                           DESKBOT_DISPLAY_COLOR_GREEN,
+                           DESKBOT_DISPLAY_COLOR_BLUE};
+  const char* rgb_name[3] = {"RED", "GREEN", "BLUE"};
+  for (int c = 0; c < 3; ++c) {
+    Adafruit_GFX* gfx = display_guide_target_begin(false);
+    gfx->fillScreen(rgb[c]);
+    display_guide_target_end();
+    log_warn("[SELFTEST] color %s", rgb_name[c]);
+    delay(1000);
+  }
+  {
+    Adafruit_GFX* gfx = display_guide_target_begin(false);
+    gfx->fillScreen(DESKBOT_DISPLAY_COLOR_BLACK);
+    display_guide_target_end();
+  }
+  log_warn("[SELFTEST] display done, back to black");
+
+  log_warn("[SELFTEST] done");
+}
+#endif
+
 void setup() {
   Serial.begin(115200);
   Serial.flush();
@@ -51,6 +110,7 @@ void setup() {
    * 本机 JPEG 硬件编码不可用；setup_camera 内用 RGB565 + frame2jpg。
    * ESP32-S3：相机 GDMA 在 WiFi STA 连接时若仍在跑，会整机挂死。 */
   static bool s_camera_ok = false;
+#if DESKBOT_HAS_CAMERA
   const bool camera_probed = setup_camera();
   if (camera_probed) {
     camera_deinit();
@@ -58,6 +118,9 @@ void setup() {
   } else {
     log_warn("[BOOT] Camera absent or failed — continuing without camera");
   }
+#else
+  log_info("[BOOT] camera disabled (DESKBOT_HAS_CAMERA=0)");
+#endif
 
   setup_display();
   display_backlight_on();
@@ -102,16 +165,18 @@ void setup() {
   }
 
   /* WiFi 后再 init；舵机 MCPWM attach 须在相机之后。 */
+#if DESKBOT_HAS_CAMERA
   if (camera_probed) {
     s_camera_ok = setup_camera();
     if (!s_camera_ok) {
       log_warn("[BOOT] Camera reinit after WiFi failed");
     }
   }
-  /* 无论相机成败：只要走过相机路径，PDM 都重挂一次更稳。 */
+  /* 相机重 init 会扰动 GDMA：PDM 重挂一次更稳；无相机板无需此步。 */
   if (!mic_restart_pdm()) {
     log_error("[BOOT] mic PDM restart failed");
   }
+#endif
   task_setup_mic();
 
   /* ---- 阶段 C：执行器就绪后再启动 pb 泵 / camera 上行 ---- */
@@ -138,6 +203,9 @@ void setup() {
   log_info("%s is Ready. http://%s", PRODUCT_NAME, WiFi.localIP().toString().c_str());
   log_warn("[BOOT] ready device=%s ws=%s wifi_ip=%s",
            get_device_id(), ws_url, WiFi.localIP().toString().c_str());
+#if DESKBOT_HW_SELF_TEST
+  run_hardware_self_test();
+#endif
   log_set_level(LOG_LEVEL_WARN);
 }
 

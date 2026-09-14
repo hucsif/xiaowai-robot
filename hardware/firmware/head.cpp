@@ -132,7 +132,9 @@ static bool execute_motor_cmd(const MotorCmd& cmd) {
 
     const int y_next = y_start + (int)(dy_total * elapsed_ms / total_ms);
     s_logical_y = constrain(y_next, Y_MIN_LIMIT, Y_MAX_LIMIT);
+#if DESKBOT_HAS_SERVO_Y
     servo_y.write(s_logical_y);
+#endif
     vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(slice));
   }
   return true;
@@ -226,12 +228,16 @@ void setup_head() {
   if (s_servos_attached) return;
   const int x = constrain(X_CENTER, X_MIN_LIMIT, X_MAX_LIMIT);
   const int y = constrain(Y_CENTER, Y_MIN_LIMIT, Y_MAX_LIMIT);
+#if DESKBOT_HAS_SERVO_Y
   if (!head_servo_attach_axis(servo_y, Y_PIN, y, "Y")) {
     log_error("[SERVO] boot: attach Y failed");
     return;
   }
+#endif
   if (!head_servo_attach_axis(servo_x, X_PIN, x, "X")) {
+#if DESKBOT_HAS_SERVO_Y
     servo_y.detach();
+#endif
     log_error("[SERVO] boot: attach X failed");
     return;
   }

@@ -86,7 +86,7 @@ ensure_local_scripts() {
 # 仅主服务进程内加载的模型：Silero VAD（onnxruntime，对话打断/切句）。
 # 人脸模型归 externals/insightface-engine（install.sh 自备），不再由此下载。
 SILERO_VAD_MODEL_PATH="$ROOT/models/silero_vad/silero_vad.onnx"
-SILERO_VAD_MODEL_URL="https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
+SILERO_VAD_MODEL_URL="https://ghfast.top/https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
 
 silero_vad_model_ready() {
   [[ -f "$SILERO_VAD_MODEL_PATH" ]]

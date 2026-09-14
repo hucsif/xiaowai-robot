@@ -64,8 +64,9 @@ require_python() {
 configure_pip_index() {
   local py="$1"
   "$py" -m pip install --upgrade pip
-  if "$py" -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null; then
-    :
+  if "$py" -m pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ 2>/dev/null; 
+  then
+    "$py" -m pip config set global.trusted-host mirrors.aliyun.com 2>/dev/null || true
   else
     export PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
   fi
