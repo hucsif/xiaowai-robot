@@ -13,6 +13,7 @@
 #include "pb_runtime.h"
 #include "ws_transport.h"
 #include "head.h"
+#include "radar/radar.h"
 #include "cmd.h"
 #include "led.h"
 #include "audio_frontend_esp_sr.h"
@@ -133,6 +134,14 @@ void setup() {
   setup_speaker();
   /* ESP-SR AFE（AEC/NS/AGC/VAD）：失败不致命，mic 自动退回原始帧。 */
   audio_frontend_setup();
+#if DESKBOT_RADAR_ENABLE
+  /* 双雷达 UART 初始化 + 采集任务：R60ABD1 @UART2(G9/G10)、LD2450 @UART1(G17/G18)。
+   * 刻意放在 WiFi 配网之前——配网失败时 setup() 会提前 return（见下方 WiFi 分支），
+   * 放其后则雷达永不启动；雷达是独立离线外设，不应依赖网络成败。
+   * 合计数据率 <1KB/s、prio 3，不会与 WiFi 初始化争抢。 */
+  (void)setup_radar();
+  task_setup_radar();
+#endif
 
   log_info("[BOOT] device_id=%s version=%s", get_device_id(), VERSION);
 
