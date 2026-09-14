@@ -141,6 +141,8 @@ void setup() {
    * 合计数据率 <1KB/s、prio 3，不会与 WiFi 初始化争抢。 */
   (void)setup_radar();
   task_setup_radar();
+#else
+  log_warn("[BOOT] radar disabled (DESKBOT_RADAR_ENABLE=0)");
 #endif
 
   log_info("[BOOT] device_id=%s version=%s", get_device_id(), VERSION);

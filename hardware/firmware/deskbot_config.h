@@ -19,7 +19,11 @@
 /** 音频统一采样率（mic/speaker/AEC 共用）。 */
 #define SAMPLE_RATE 16000
 
-#define DESKBOT_WS_HOST "192.168.3.206"
+/* 本地 service 的地址。虚拟机 IP 由 DHCP 动态分配，变过一次
+ * （192.168.3.206 → 192.168.123.9），改这里的 IP 需重新烧录。
+ * 想免去重烧：在板子 AP 配网页加「自定义云服务器」URL（存 NVS，优先于本宏），
+ * 或给虚拟机配静态 IP / 路由器做 DHCP 保留。 */
+#define DESKBOT_WS_HOST "192.168.123.9"
 // #define DESKBOT_WS_HOST "39.107.38.241"
 #define DESKBOT_WS_PORT 9000
 
