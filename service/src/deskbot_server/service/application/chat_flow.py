@@ -33,7 +33,7 @@ from deskbot_server.service.application.llm_error_fallback import (
     stop_llm_error_motion_feedback,
 )
 from deskbot_server.service.application.llm_tool_runner import execute_llm_tools
-from deskbot_server.service.application.tool_interim_tts import build_tool_interim_tts
+from deskbot_server.service.application.tool_interim_tts import resolve_interim_tts
 from deskbot_server.utils.util import _ms_between
 
 if TYPE_CHECKING:
@@ -44,8 +44,9 @@ logger = logging.getLogger("deskbot-server")
 
 _SCHEDULED_TASK_PREFIX = "[系统定时任务]"
 _QUEST_PROACTIVE_PREFIX = "[系统剧情推进]"
-# 社交主动问候轮：不进 _SYSTEM_INITIATED_PREFIXES —— 不强制开口，
-# LLM 判定此刻无话可说时可 need_reply=false 静默退出（区别于剧情/定时轮必须口播）
+# 社交/剧情主动轮：不进 _SYSTEM_INITIATED_PREFIXES —— 不强制开口，
+# LLM 判定此刻无话可说时可 need_reply=false 静默退出（区别于定时轮必须口播）
+# （剧情任务重构后日常/长期任务永续 running，是否开口须由模型结合今日记录判断）
 _SOCIAL_PROACTIVE_PREFIX = "[系统主动问候]"
 _SYSTEM_INITIATED_PREFIXES = (_SCHEDULED_TASK_PREFIX, _QUEST_PROACTIVE_PREFIX)
 _ALL_SYSTEM_PREFIXES = _SYSTEM_INITIATED_PREFIXES + (_SOCIAL_PROACTIVE_PREFIX,)
@@ -92,6 +93,54 @@ class _TtsPrefetch:
         self.cancel()
         self.task = asyncio.create_task(self._chat.tts_phoneme_segments(text, device_id=self._device_id))
         logger.info("[LLM] 流式 tts 就绪，提前启动 TTS prefetch text=%r", text[:80])
+
+
+# 后台过渡语任务：持强引用防 GC，播完自清
+_INTERIM_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_interim_tts(
+    downlink: DownlinkPort,
+    chat: ChatService,
+    text: str,
+    prefetch: _TtsPrefetch,
+    *,
+    request_id: str | None,
+    device_id: str | None,
+    round_idx: int,
+    device_ws: Any | None = None,
+) -> asyncio.Task | None:
+    """过渡语「边干活边说」：后台任务播放，立即返回不当阻塞点。
+
+    调用方（工具轮）不等它——工具执行与 TTS 合成并行推进；过渡语与最终回复都在
+    同一设备的 pb 通道按序下发，后到的最终回复自然接管画面，无需额外协调。
+    """
+    playback = (text or "").strip()
+    if not playback:
+        return None
+    # 工具轮里 prefetch 可能已拿本轮 envelope 的 tts 起过合成——此处文本才是要播的，
+    # 丢弃旧的避免误播；正式回复的 tts 会在收尾轮重新触发 prefetch。
+    prefetch.cancel()
+
+    async def _guarded() -> None:
+        try:
+            await _play_interim_tts(
+                downlink, chat, playback, prefetch, request_id=request_id, device_id=device_id,
+                round_idx=round_idx, device_ws=device_ws,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 过渡语是锦上添花：播不出来也不能影响本轮正式回复
+            logger.warning(
+                "[LLM] 过渡 TTS 播报失败 device_id=%s req=%s round=%d", device_id, request_id, round_idx,
+                exc_info=True,
+            )
+
+    task = asyncio.create_task(_guarded())
+    _INTERIM_TASKS.add(task)
+    task.add_done_callback(_INTERIM_TASKS.discard)
+    return task
 
 
 async def _play_interim_tts(
@@ -407,10 +456,14 @@ async def complete_llm_with_tool_loop(
     llm_calls: list[dict[str, Any]] = []
     answer = ""
     parsed: dict[str, Any] = parse_llm_reply("")
+    interim_spoken = False  # 本次请求是否已说过过渡语（整轮只说一次）
     system_prompt: str | None = None
     captured_system_prompt = False
     llm_model = llm_model_label(device_id)
-    native_schemas = build_native_tool_schemas(device_id=device_id)
+    # say 过渡语工具只在首轮工具轮提供：后续轮模型看不到它自然不会调用，
+    # 免掉「每轮都插一句」的观感问题（无需服务端额外拦截）。
+    tool_schemas_first_round = build_native_tool_schemas(device_id=device_id, is_tool_round=True)
+    tool_schemas_later_round = build_native_tool_schemas(device_id=device_id)
 
     def _on_system_prompt(content: str) -> None:
         nonlocal system_prompt, captured_system_prompt
@@ -442,7 +495,7 @@ async def complete_llm_with_tool_loop(
         try:
             result = await chat.llm_tool_round(
                 user_text,
-                tools=native_schemas,
+                tools=tool_schemas_first_round if round_idx == 0 else tool_schemas_later_round,
                 tool_choice="auto",
                 **_base_kwargs(round_idx),
             )
@@ -480,6 +533,7 @@ async def complete_llm_with_tool_loop(
                     pass
                 native_tools.append(row)
             all_tools.extend(native_tools)
+            envelope_reply = ""
             if content:
                 maybe = parse_llm_reply(content)
                 if maybe.get("json_ok") and maybe.get("reply"):
@@ -491,13 +545,27 @@ async def complete_llm_with_tool_loop(
                     answer = content
                     parsed = maybe
                     break
-            interim_text = build_tool_interim_tts(native_tools)
-            if interim_text and on_interim_tts_play is not None:
-                await on_interim_tts_play(interim_text, round_idx + 1)
+                # 工具轮 envelope：tts 非空即过渡语（本模块「模型自述」路径），
+                # 空 tts + 只有动作字段是正常形态，不算过渡语
+                envelope_reply = str(maybe.get("reply") or "")
             tool_results = await _execute_tools_round(
                 native_tools, device_id=str(device_id), session_id=session_id, device_ws=device_ws
             )
             all_tool_results.extend(tool_results)
+            # 「边干活边说」：过渡语后台播报，工具执行与 TTS 合成并行推进，
+            # 不占用本轮的端到端延迟；每轮最多一句，round 2+ 模型已看不见 say。
+            if on_interim_tts_play is not None and not interim_spoken:
+                say_text = next(
+                    (str(r.get("reply") or "") for r in tool_results
+                     if str(r.get("tool") or "") == "say" and r.get("ok")),
+                    "",
+                )
+                interim_text = resolve_interim_tts(
+                    say_text=say_text, model_text=envelope_reply, tools=native_tools
+                )
+                if interim_text:
+                    interim_spoken = True
+                    await on_interim_tts_play(interim_text, round_idx + 1)
             logger.info(
                 "[LLM] native tool round=%d device_id=%s req=%s tools=%s results=%s",
                 round_idx + 1, device_id, request_id,
@@ -672,7 +740,8 @@ async def run_chat_turn(
         tts_prefetch = _TtsPrefetch(chat, device_id=device_id)
 
         async def _on_interim_tts_play(text: str, round_idx: int) -> None:
-            await _play_interim_tts(
+            # 派生后台任务即刻返回：工具轮不等过渡语播完（边干活边说）
+            _spawn_interim_tts(
                 downlink, chat, text, tts_prefetch, request_id=request_id, device_id=device_id, round_idx=round_idx,
                 device_ws=device_ws,
             )
@@ -699,9 +768,12 @@ async def run_chat_turn(
         llm_moves = list(parsed.get("moves") or [])
         llm_anims = list(parsed.get("anims") or [])
         need_reply = bool(parsed.get("need_reply", True))
-        if is_scheduled or is_quest_proactive:
-            need_reply = True  # 系统发起轮必须开口，禁止静默
-        # 社交主动问候轮允许静默退出：meta 汇报语/空文案一律按不开口处理
+        if is_scheduled:
+            need_reply = True  # 定时提醒轮必须开口，禁止静默
+        # 剧情/社交主动轮允许静默退出：剧情任务（尤其永续的日常/长期）推进与否由
+        # 模型依据 system 里的任务与今日记录判断（need_reply=false 即静默收尾，
+        # 下方兜底口播语仅在 need_reply=true 且 tts 为空/汇报腔时启用）。
+        # 社交轮额外：meta 汇报语/空文案一律按不开口处理
         # （防「已问候」类汇报语被照字朗读；有动作则走下方静默分支只下发动作）
         if is_social_proactive and _social_tts_looks_like_meta_report(reply_text):
             need_reply = False
@@ -789,7 +861,7 @@ async def run_chat_turn(
         if not parsed["json_ok"]:
             logger.warning("[LLM] 输出未通过 JSON 解析，按整段文本走 TTS。device_id=%s req=%s", device_id, request_id)
 
-        if not need_reply and not (is_scheduled or is_quest_proactive):
+        if not need_reply and not is_scheduled:
             has_motion = bool(llm_moves or llm_anims)
             if has_motion:
                 logger.info(

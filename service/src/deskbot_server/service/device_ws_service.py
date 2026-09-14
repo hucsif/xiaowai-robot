@@ -12,7 +12,14 @@ from typing import Any
 
 from websockets.exceptions import ConnectionClosed
 
-from deskbot_server.constants import PB_CHUNK_GAP_SEC, PB_MAX_PCM_BIN_BYTES, SAFE_SEND_TIMEOUT
+from deskbot_server.constants import (
+    PB_ACK_END_GRACE_SEC,
+    PB_ACK_END_TIMEOUT_SEC,
+    PB_ACK_WINDOW_TIMEOUT_SEC,
+    PB_CHUNK_GAP_SEC,
+    PB_MAX_PCM_BIN_BYTES,
+    SAFE_SEND_TIMEOUT,
+)
 from deskbot_server.model.pb_seq import PbBlock, PbSeq, PbType
 from deskbot_server.pb.wire import device_pb_json_msg
 from deskbot_server.service.application.asr_chat_uplink import pack_ws_downlink_frame, parse_packed_frame
@@ -134,7 +141,7 @@ class DeviceWsService(metaclass=SingletonMeta):
     """设备 WebSocket 服务（单例）。
 
     统一管理：设备元数据、ws 连接生命周期、PbSeq 消息队列 + 窗口流控、pb 帧下行。
-    每个设备同时只有一条 WebSocket 连接。
+    每个设备只有一条主实时连接；相机等纯上行连接不占用该槽位。
 
     下行管道（两层队列串行）：
     send(PbSeq) → PbSeq 队列（优先级/抢占/ACK 流控）
@@ -175,11 +182,13 @@ class DeviceWsService(metaclass=SingletonMeta):
         语音轮开始时采样，作为该轮机器人「看到的」画面；播放期间固件暂停上行，
         缓存通常即说话句尾一帧。无人脸跟踪期间也可能无帧，返回 None。
         """
-        entry = self._camera_frame_cache.get(str(device_id or "").strip())
+        key = str(device_id or "").strip()
+        entry = self._camera_frame_cache.get(key)
         if entry is None:
             return None
         mono_ts, jpeg = entry
         if time.monotonic() - mono_ts > max_age_s:
+            self._camera_frame_cache.pop(key, None)
             return None
         return jpeg
 
@@ -232,7 +241,7 @@ class DeviceWsService(metaclass=SingletonMeta):
         logger.info("[DeviceWsService] Shutdown complete")
 
     # ======================================================================
-    # 连接管理（一个设备同时只有一条连接）
+    # 连接管理（一个设备同时只有一条主实时连接）
     # ======================================================================
 
     async def register(self, device_id: str, ws, *, claim_slot: bool = True) -> None:
@@ -493,13 +502,30 @@ class DeviceWsService(metaclass=SingletonMeta):
                                 "[pb TX] %s 末窗口已下发 req=%s last_idx=%d 等待 pb_end",
                                 device_id, req, entries[batch_end - 1].idx,
                             )
-                        ack_type = await self._wait_ack(entry, req, want_end=is_last_window)
+                        ack_timeout = None
+                        if is_last_window:
+                            declared_sec = sum(max(0, int(item.chunk_ms or 0)) for item in entries) / 1000.0
+                            ack_timeout = max(
+                                PB_ACK_END_TIMEOUT_SEC,
+                                declared_sec + PB_ACK_END_GRACE_SEC,
+                            )
+                        ack_type = await self._wait_ack(
+                            entry, req, want_end=is_last_window, timeout=ack_timeout,
+                        )
                         if is_last_window and ack_type == "pb_end":
                             logger.info(
                                 "[pb ACK] %s 收到 pb_end req=%s 末窗口到播毕 %.0fms",
                                 device_id, req, (time.monotonic() - t_pb_end_wait) * 1000,
                             )
                         if ack_type == "pb_cancel":
+                            cancel_block = PbBlock(type=PbType.CANCEL, req=req, idx=0)
+                            await self._do_send_to_device(device_id, cancel_block, generation=generation)
+                            break
+                        if ack_type == "pb_timeout":
+                            logger.warning(
+                                "[pb ACK] %s 等待超时 req=%s last_idx=%d want_end=%s，取消当前链",
+                                device_id, req, entries[batch_end - 1].idx, is_last_window,
+                            )
                             cancel_block = PbBlock(type=PbType.CANCEL, req=req, idx=0)
                             await self._do_send_to_device(device_id, cancel_block, generation=generation)
                             break
@@ -535,7 +561,14 @@ class DeviceWsService(metaclass=SingletonMeta):
             except TimeoutError:
                 return _IDLE  # type: ignore[return-value]
 
-    async def _wait_ack(self, entry: _DeviceEntry, req: str, *, want_end: bool = False) -> str | None:
+    async def _wait_ack(
+        self,
+        entry: _DeviceEntry,
+        req: str,
+        *,
+        want_end: bool = False,
+        timeout: float | None = None,
+    ) -> str | None:
         """等待匹配 req 的 pb_ack（消费 ack_queue）。
 
         - ``pb_cancel``（_enqueue 抢占哨兵，无 req）优先返回；
@@ -544,8 +577,17 @@ class DeviceWsService(metaclass=SingletonMeta):
         - ``want_end=True``（末窗口）：必须等到 ``ack_type == "pb_end"``，
           期间 ``pb_chunk`` 等同 req ack 静默消费。
         """
+        if timeout is None:
+            timeout = PB_ACK_END_TIMEOUT_SEC if want_end else PB_ACK_WINDOW_TIMEOUT_SEC
+        deadline = time.monotonic() + timeout
         while True:
-            ack = await entry.ack_queue.get()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "pb_timeout"
+            try:
+                ack = await asyncio.wait_for(entry.ack_queue.get(), timeout=remaining)
+            except TimeoutError:
+                return "pb_timeout"
             if ack.get("type") == "pb_cancel":
                 return "pb_cancel"
             if ack.get("req") != req:
@@ -903,22 +945,7 @@ class DeviceWsService(metaclass=SingletonMeta):
 
                         if msg_type == "camera_frame":
                             if attached_media:
-                                if device_id:
-                                    # 最近帧缓存：供该轮对话开始时按 request_id 留存画面
-                                    self._camera_frame_cache[device_id] = (time.monotonic(), bytes(attached_media))
-                                spawn(
-                                    CameraFaceService().process(
-                                        device_id, attached_media,
-                                        frame_source="asr_chat", log_channel="/asr_chat",
-                                    )
-                                )
-                                if self._bus_service is not None and device_id:
-                                    import base64
-                                    await self._bus_service.broadcast(device_id, {
-                                        "type": "camera_frame",
-                                        "device_id": device_id,
-                                        "data": base64.b64encode(attached_media).decode("ascii"),
-                                    })
+                                self._accept_camera_frame(device_id, attached_media, source="asr_chat")
                             continue
 
                         if msg_type == "boot_connect":
@@ -964,8 +991,60 @@ class DeviceWsService(metaclass=SingletonMeta):
                 pass
             if device_id:
                 remove_device(device_id)
-                self._camera_frame_cache.pop(device_id, None)
                 await self.unregister(device_id, websocket)
+
+    def _accept_camera_frame(self, device_id: str | None, media: bytes, *, source: str) -> None:
+        """缓存最新帧并投递耗时业务；调用方的 WS 接收循环不等待处理完成。"""
+        frame = bytes(media)
+        if device_id:
+            self._camera_frame_cache[device_id] = (time.monotonic(), frame)
+        spawn(
+            CameraFaceService().process(
+                device_id,
+                frame,
+                frame_source=source,
+                log_channel=f"/{source}",
+            )
+        )
+        if self._bus_service is not None and device_id:
+            spawn(self._broadcast_camera_frame(device_id, frame))
+
+    async def _broadcast_camera_frame(self, device_id: str, frame: bytes) -> None:
+        import base64
+
+        await self._bus_service.broadcast(
+            device_id,
+            {
+                "type": "camera_frame",
+                "device_id": device_id,
+                "data": base64.b64encode(frame).decode("ascii"),
+            },
+        )
+
+    async def handle_camera_uplink(self, websocket, device_id: str | None) -> None:
+        """独立相机上行；不注册为设备主连接，避免抢占 ``/asr_chat``。"""
+        peer = WsUtils.peer_str(websocket)
+        ready = _json_msg({"type": "ready", "channel": "camera", "device_id": device_id})
+        if not await WsUtils.safe_send(websocket, ready):
+            return
+        logger.info("[/camera_uplink] ready device_id=%s peer=%s", device_id, peer)
+        try:
+            async for message in websocket:
+                if not isinstance(message, (bytes, bytearray)):
+                    continue
+                frame = parse_packed_frame(bytes(message))
+                if frame is None or frame.doc.get("type") != "camera_frame" or not frame.bin:
+                    logger.warning(
+                        "[/camera_uplink] invalid frame device_id=%s bytes=%d",
+                        device_id,
+                        len(message),
+                    )
+                    continue
+                self._accept_camera_frame(device_id, frame.bin, source="camera_uplink")
+                if device_id:
+                    await self.touch(device_id)
+        except ConnectionClosed as closed:
+            logger.info("[/camera_uplink] closed device_id=%s peer=%s: %s", device_id, peer, closed)
 
     async def _run_asr_turn(
         self,

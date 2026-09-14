@@ -18,10 +18,11 @@ from deskbot_server.service.web_tools import webfetch, websearch
 
 logger = logging.getLogger("deskbot-server")
 
-# 工具参数键名容错（模型常把 user_name/chat_message 写成近似键）：
+# 工具参数键名容错（模型常把 user_name/chat_message/reason 写成近似键）：
 # 前者按序取第一个非空，后者用于识别「身份键」以把剩余事实键拼成可读行
 _NAME_KEYS = ("user_name", "person_name", "user", "person", "name")
 _MESSAGE_KEYS = ("chat_message", "message", "content", "text", "msg")
+_REASON_KEYS = ("reason", "result", "cause", "note", "description", "text", "msg")
 _IDENT_KEYS = frozenset({"tool", "type", "function", "id", "arguments", "tool_call_id"}) | set(_NAME_KEYS) | set(_MESSAGE_KEYS)
 
 
@@ -50,7 +51,20 @@ async def execute_llm_tools(
         if not tool:
             continue
         try:
-            if tool == "register_face":
+            if tool == "say":
+                # 过渡语工具：本身不下发、不阻塞，只把要说的文本回传调用方
+                # （chat_flow 取 reply 后播报）。哨兵形态与普通工具一致，避免模型
+                # 看出「说了但没生效」而重试。单独调用不产生任何动作（防走神），
+                # 返回错误让模型下一轮补上真正的工具调用。
+                if not any(
+                    str(t.get("tool") or t.get("name") or "").strip().lower() not in ("", "say")
+                    for t in tools
+                    if isinstance(t, dict)
+                ):
+                    results.append({"tool": "say", "ok": False, "error": "单独调用 say 没有效果，请同时调用要执行的工具"})
+                else:
+                    results.append({"tool": "say", "ok": True, "reply": str(raw.get("text") or "")})
+            elif tool == "register_face":
                 name = str(raw.get("name") or raw.get("person_name") or "").strip()
                 fid_raw = raw.get("face_id")
                 face_id = int(fid_raw) if fid_raw is not None else None
@@ -130,32 +144,18 @@ async def execute_llm_tools(
             elif tool == "session":
                 out = execute_session_tool(raw, device_id=dev)
                 results.append(out)
-            elif tool == "update_task_result":
+            elif tool == "complete_task":
                 playbook = _require_quest_playbook(dev)
                 task_id = str(raw.get("task_id") or "").strip()
                 if not task_id:
-                    raise ValueError("update_task_result 需要 task_id")
-                out = QuestService().update_task_result(
-                    dev, playbook, task_id,
-                    str(raw.get("status") or "").strip(),
-                    str(raw.get("result") or "").strip(),
+                    raise ValueError("complete_task 需要 task_id")
+                user = next(
+                    (str(raw.get(k) or "").strip() for k in _NAME_KEYS if str(raw.get(k) or "").strip()), ""
                 )
-                results.append({"tool": tool, "ok": True, **out})
-            elif tool == "update_task_strategy":
-                playbook = _require_quest_playbook(dev)
-                task_id = str(raw.get("task_id") or "").strip()
-                if not task_id:
-                    raise ValueError("update_task_strategy 需要 task_id")
-                out = QuestService().update_task_strategy(
-                    dev, playbook, task_id, str(raw.get("strategy") or "").strip()
+                reason = next(
+                    (str(raw.get(k) or "").strip() for k in _REASON_KEYS if str(raw.get(k) or "").strip()), ""
                 )
-                results.append({"tool": tool, "ok": True, **out})
-            elif tool == "contribute_score":
-                playbook = _require_quest_playbook(dev)
-                task_id = str(raw.get("task_id") or "").strip()
-                if not task_id:
-                    raise ValueError("contribute_score 需要 task_id")
-                out = QuestService().contribute_score(dev, playbook, task_id, int(raw.get("points") or 0))
+                out = QuestService().complete_task(dev, playbook, task_id, user=user, reason=reason)
                 results.append({"tool": tool, "ok": True, **out})
             elif tool in ("miot", "mihome", "mijia"):
                 if not dev:
