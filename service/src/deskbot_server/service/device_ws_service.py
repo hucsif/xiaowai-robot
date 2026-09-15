@@ -422,8 +422,10 @@ class DeviceWsService(metaclass=SingletonMeta):
             # ⚠️ 必须走与下面相同的「wait 时 set _done」路径 ——
             #    否则 _run_pb_playback 里 await send(wait=True) 会永久挂起。
             if turn_epoch is not None and turn_epoch != entry.turn_epoch:
-                logger.debug("[send] %s drop stale turn_epoch=%d cur=%d req=%s",
-                             device_id, turn_epoch, entry.turn_epoch, pb_seq.req)
+                # 用 info 不用 debug：默认日志级别是 INFO，debug 会被过滤掉，
+                # 那样 barge-in 生效时日志上完全看不出来。
+                logger.info("[send] %s 丢弃过期轮代 turn_epoch=%d cur=%d req=%s",
+                            device_id, turn_epoch, entry.turn_epoch, pb_seq.req)
                 if wait:
                     pb_seq._done.set()
                 return 0

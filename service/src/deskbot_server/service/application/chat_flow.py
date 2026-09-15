@@ -1152,7 +1152,16 @@ async def _send_pb_pairs(
     )
     success = await device_ws.send(device_id, pb_seq, wait=True, turn_epoch=turn_epoch)
     if not success:
-        logger.error("[pb TX] enqueue 失败 device_id=%s req=%s", device_id, pb_req)
+        # 区分「被 barge-in 打断」与「真的发送失败」——前者是正常流程，不该报 error。
+        stale = (
+            turn_epoch is not None
+            and hasattr(device_ws, "current_turn_epoch")
+            and device_ws.current_turn_epoch(device_id) != turn_epoch
+        )
+        if stale:
+            logger.info("[pb TX] 本轮已被新语音打断，停止下发 device_id=%s req=%s", device_id, pb_req)
+        else:
+            logger.error("[pb TX] enqueue 失败 device_id=%s req=%s", device_id, pb_req)
     return not success
 
 
