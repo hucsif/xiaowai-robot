@@ -23,7 +23,7 @@
  * （192.168.3.206 → 192.168.123.9），改这里的 IP 需重新烧录。
  * 想免去重烧：在板子 AP 配网页加「自定义云服务器」URL（存 NVS，优先于本宏），
  * 或给虚拟机配静态 IP / 路由器做 DHCP 保留。 */
-#define DESKBOT_WS_HOST "192.168.123.9"
+#define DESKBOT_WS_HOST "192.168.3.236"
 // #define DESKBOT_WS_HOST "39.107.38.241"
 #define DESKBOT_WS_PORT 9000
 
