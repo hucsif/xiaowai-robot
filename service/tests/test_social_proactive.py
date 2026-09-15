@@ -207,6 +207,9 @@ def test_social_runner_full_path(monkeypatch):
         def _get_ws(self, device_id):
             return object()
 
+        def current_turn_epoch(self, device_id):  # barge-in 轮代：None=不门控
+            return None
+
     class FakeChat:
         settings = SimpleNamespace()
 

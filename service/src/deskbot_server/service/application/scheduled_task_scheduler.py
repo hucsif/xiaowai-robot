@@ -114,6 +114,7 @@ class ScheduledTaskScheduler:
                 request_id=req_id,
                 device_id=device_id,
                 device_ws=self._device_ws,
+                turn_epoch=self._device_ws.current_turn_epoch(device_id),
                 t_asr_text=t0,
                 force_voice=True,
                 reuse_session_id=task_session_id,

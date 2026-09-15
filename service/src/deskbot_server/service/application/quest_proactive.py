@@ -83,6 +83,7 @@ class QuestProactiveRunner:
                 request_id=req_id,
                 device_id=dev,
                 device_ws=self._device_ws,
+                turn_epoch=self._device_ws.current_turn_epoch(dev),
                 t_asr_text=t0,
                 force_voice=True,
                 bus_service=self._bus_service,

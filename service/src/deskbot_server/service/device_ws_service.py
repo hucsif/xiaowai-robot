@@ -13,6 +13,7 @@ from typing import Any
 from websockets.exceptions import ConnectionClosed
 
 from deskbot_server.constants import (
+    BARGE_IN_ENABLED,
     PB_ACK_END_GRACE_SEC,
     PB_ACK_END_TIMEOUT_SEC,
     PB_ACK_WINDOW_TIMEOUT_SEC,
@@ -85,6 +86,15 @@ class _DeviceEntry:
     # ── ws 连接（每个设备同时只有一条连接）──
     ws: Any = None  # WebSocket | None
     generation: int = 0  # 连接代数：每次抢占槽位 +1；worker/job 按代数门控，旧代任务不得向新连接发送
+
+    # ── 对话轮代（barge-in）──
+    # 新语音轮到来时 +1：使在跑的旧语音轮【和】主动轮（定时提醒/剧情推进）
+    # 的剩余内容全部失效 —— 用户说话优先。
+    # 主动轮启动时【不】+1（语音优先，不能被主动轮反向杀掉在跑的语音轮）。
+    # 用法见 send(turn_epoch=...)：只有显式传入的调用点才受门控，
+    # 待机/主动轮等不传 → 零影响。
+    turn_epoch: int = 0
+    turn_task: Any = None  # 当前语音轮任务（诊断用；主动 cancel 留待后续）
 
     # ── PbSeq 消息队列（优先级 + 抢占 + ACK 流控）──
     queue: list = field(default_factory=list)                           # list[PbSeq]
@@ -364,15 +374,38 @@ class DeviceWsService(metaclass=SingletonMeta):
         return entry.ws if entry is not None else None
 
     # ======================================================================
+    # barge-in：对话轮代
+    # ======================================================================
+
+    def current_turn_epoch(self, device_id: str | None) -> int | None:
+        """读设备当前轮代（**不递增**）。
+
+        主动轮（定时提醒/剧情推进/社交问候）在起轮时读一次并透传给
+        ``run_chat_turn(turn_epoch=...)`` —— 这样用户说话（语音轮 +1）时，
+        主动轮的剩余下发会被 send 门控掉，即「主动轮也能被打断」。
+        主动轮自己【不】递增，避免反向杀掉在跑的语音轮。
+        """
+        if not device_id:
+            return None
+        entry = self._devices.get(device_id)
+        return entry.turn_epoch if entry else None
+
+    # ======================================================================
     # PbSeq 消息发送（上层队列：优先级 + 抢占 + ACK 流控）
     # ======================================================================
 
     async def send(
-        self, device_id: str, pb_seq: PbSeq, *, wait: bool = False
+        self, device_id: str, pb_seq: PbSeq, *, wait: bool = False,
+        turn_epoch: int | None = None,
     ) -> int:
         """发送 PbSeq 到设备。
 
         wait=True 时阻塞到设备播完（设备回 pb_end 后解除）。
+
+        ``turn_epoch``：对话轮代号（barge-in 用）。传入时若与设备当前代号不符,
+        说明本轮已被新的语音轮打断 → 丢弃不下发。``None`` = 不门控
+        （待机动画 / 主动轮 / 调试台等调用点不传，行为与改动前一致）。
+
         返回 0=失败（无连接或被丢弃），1=入队成功。
         """
         if not device_id:
@@ -382,6 +415,15 @@ class DeviceWsService(metaclass=SingletonMeta):
             entry = self._devices.get(device_id)
             if entry is None or entry.stopped:
                 logger.warning("[send] 设备不可用 device_id=%s entry=%s stopped=%s", device_id, entry is not None, getattr(entry, 'stopped', None) if entry else None)
+                if wait:
+                    pb_seq._done.set()
+                return 0
+            # barge-in 门控：代号过期（本轮已被新语音轮打断）→ 丢弃。
+            # ⚠️ 必须走与下面相同的「wait 时 set _done」路径 ——
+            #    否则 _run_pb_playback 里 await send(wait=True) 会永久挂起。
+            if turn_epoch is not None and turn_epoch != entry.turn_epoch:
+                logger.debug("[send] %s drop stale turn_epoch=%d cur=%d req=%s",
+                             device_id, turn_epoch, entry.turn_epoch, pb_seq.req)
                 if wait:
                     pb_seq._done.set()
                 return 0
@@ -934,13 +976,34 @@ class DeviceWsService(metaclass=SingletonMeta):
                             )
                             if utterance:
                                 logger.info("[/asr_chat] VAD切句完成 device_id=%s pcm_bytes=%d -> 触发ASR", device_id, len(utterance))
-                                spawn(self._run_asr_turn(
+                                # ── barge-in：新语音轮开始 ──
+                                # 轮代 +1 → 在跑的旧语音轮【和】主动轮（定时提醒/剧情推进）
+                                # 的剩余下发全部被 send(turn_epoch=...) 门控掉，用户说话优先。
+                                entry = self._devices.get(device_id)
+                                interrupted = bool(
+                                    entry and entry.turn_task and not entry.turn_task.done()
+                                )
+                                turn_epoch = None
+                                if entry is not None and BARGE_IN_ENABLED:
+                                    entry.turn_epoch += 1
+                                    turn_epoch = entry.turn_epoch
+                                if interrupted and BARGE_IN_ENABLED:
+                                    # 只在真打断时重置 VAD（丢掉打断瞬间的残余音频，
+                                    # 避免污染下一轮切句）；正常切句不重置，否则会破坏
+                                    # Silero 的 hangover 状态。
+                                    logger.info("[/asr_chat] 打断上一轮 device_id=%s epoch=%s",
+                                                device_id, turn_epoch)
+                                    session.cancel_rom_uplink()
+                                task = spawn(self._run_asr_turn(
                                     websocket, pipeline, utterance,
                                     device_id=device_id,
                                     uplink_sr=session.rom_sr,
                                     uplink_ch=session.rom_ch,
                                     uplink_codec=session.rom_codec,
+                                    turn_epoch=turn_epoch,
                                 ))
+                                if entry is not None:
+                                    entry.turn_task = task
                             continue
 
                         if msg_type == "camera_frame":
@@ -1056,8 +1119,22 @@ class DeviceWsService(metaclass=SingletonMeta):
         uplink_sr: int = 16000,
         uplink_ch: int = 1,
         uplink_codec: str = "opus",
+        turn_epoch: int | None = None,
     ) -> None:
-        """VAD 切出一句后：ASR → LLM → TTS。"""
+        """VAD 切出一句后：ASR → LLM → TTS。
+
+        ``turn_epoch``：本轮代号（barge-in）。各阶段边界会检查它是否仍是最新，
+        过期即放弃本轮 —— 避免旧轮算完 LLM 后把新回答抢回去（串台）。
+        ``None`` = 不门控（保持旧调用点的行为，测试也走这条路）。
+        """
+
+        def _stale() -> bool:
+            """本轮是否已被新的语音轮打断。"""
+            if turn_epoch is None or not device_id:
+                return False
+            entry = self._devices.get(device_id)
+            return entry is not None and turn_epoch != entry.turn_epoch
+
         from deskbot_server.service.application.capability_labels import asr_model_label
         from deskbot_server.service.application.convo_audio_store import ConvoAudioStore
         from deskbot_server.service.application.ws_chat_turn import publish_ws_chat_turn, run_ws_chat_turn
@@ -1120,6 +1197,12 @@ class DeviceWsService(metaclass=SingletonMeta):
             "[ASR] 识别成功 device_id=%s req=%s audio_ms=%d asr_ms=%.0f text=%r",
             device_id, request_id, seg_duration_ms, asr_ms, text,
         )
+
+        # barge-in 检查点①：ASR 期间若已来了新语音，本轮过期 → 不再往下走
+        # （省掉声纹等待与注意力门控的开销）
+        if _stale():
+            logger.warning("[turn] 被新语音打断（ASR 后），放弃本轮 req=%s", request_id)
+            return
 
         # 先留存媒体（原声 / 最近帧），再发 asr_done：让用户气泡在 ASR 完成当下
         # 就能拿到音频与人脸图（live 广播即时渲染，不等 LLM/TTS 终态事件）
@@ -1195,6 +1278,13 @@ class DeviceWsService(metaclass=SingletonMeta):
             )
             return
 
+        # barge-in 检查点②（最关键）：起 LLM 之前的最后一道闸。
+        # 少了这道，旧轮会白跑一次 LLM 并产出回答，再发 PbSeq 把新回答抢回去 ——
+        # 就是「问下一个问题时突然冒出上一个回答」的来源。
+        if _stale():
+            logger.warning("[turn] 被新语音打断（LLM 前），放弃本轮 req=%s", request_id)
+            return
+
         try:
             flow = await run_ws_chat_turn(
                 websocket,
@@ -1203,6 +1293,7 @@ class DeviceWsService(metaclass=SingletonMeta):
                 request_id=request_id,
                 device_ws=self,
                 device_id=device_id,
+                turn_epoch=turn_epoch,
                 t_asr_start=t_asr_start,
                 t_asr_text=t_asr_text,
                 bus_service=self._bus_service,

@@ -22,6 +22,17 @@ PB_ACK_WINDOW_TIMEOUT_SEC = max(0.5, float(os.environ.get("PB_ACK_WINDOW_TIMEOUT
 # 末窗口等待的是执行器真正播毕，需覆盖正常音频尾部，但仍必须有硬上限。
 PB_ACK_END_TIMEOUT_SEC = max(1.0, float(os.environ.get("PB_ACK_END_TIMEOUT_SEC", "15.0")))
 PB_ACK_END_GRACE_SEC = max(0.0, float(os.environ.get("PB_ACK_END_GRACE_SEC", "3.0")))
+
+# barge-in：用户说话时打断机器人正在播的回答，放弃旧轮、按新问题重新回答。
+# 0=关闭（回到改动前的行为：新旧轮并行赛跑，旧轮算完会抢回回答）。
+# 注意这不是「开关某个进程」，而是「新语音轮是否递增轮代」——
+# 关掉后所有 turn_epoch 恒为 None，send 不做门控，行为与改动前一致。
+BARGE_IN_ENABLED = os.environ.get("BARGE_IN_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 # ESP32 打包帧 JSON 上限（字节）；与固件 DESKBOT_MAX_PACKED_JSON_LEN 对齐
 PB_MAX_WIRE_JSON_BYTES = max(4096, int(os.environ.get("PB_MAX_WIRE_JSON_BYTES", str(64 * 1024))))
 # ESP32 WS 单帧 BINARY（PCM）上限；默认按 10s@16kHz mono s16le（统一下发采样率，10000ms→320000B）

@@ -109,6 +109,7 @@ def _spawn_interim_tts(
     device_id: str | None,
     round_idx: int,
     device_ws: Any | None = None,
+    turn_epoch: int | None = None,
 ) -> asyncio.Task | None:
     """过渡语「边干活边说」：后台任务播放，立即返回不当阻塞点。
 
@@ -126,7 +127,7 @@ def _spawn_interim_tts(
         try:
             await _play_interim_tts(
                 downlink, chat, playback, prefetch, request_id=request_id, device_id=device_id,
-                round_idx=round_idx, device_ws=device_ws,
+                round_idx=round_idx, device_ws=device_ws, turn_epoch=turn_epoch,
             )
         except asyncio.CancelledError:
             raise
@@ -153,6 +154,7 @@ async def _play_interim_tts(
     device_id: str | None,
     round_idx: int,
     device_ws: Any | None = None,
+    turn_epoch: int | None = None,
 ) -> None:
     """工具轮过渡语：复用流式 prefetch 任务，与工具执行并行下发 pb。"""
     playback = (text or "").strip()
@@ -193,6 +195,7 @@ async def _play_interim_tts(
         auto_face_turn=True,
         prefetch_tts=task,
         device_ws=device_ws,
+        turn_epoch=turn_epoch,
     )
 
 
@@ -206,6 +209,7 @@ async def _play_llm_error_fallback(
     device_ws: Any | None,
     t_asr_start: float | None,
     llm_exc: Exception,
+    turn_epoch: int | None = None,
 ) -> None:
     """LLM 调用失败：口播道歉 + 连续 idle 舵机，避免点头停后长时间无反馈。"""
     if not get_auto_reply(device_id):
@@ -250,6 +254,7 @@ async def _play_llm_error_fallback(
             result=result,
             t_asr_start=t_asr_start,
             device_ws=device_ws,
+            turn_epoch=turn_epoch,
         )
     finally:
         await stop_llm_error_motion_feedback(motion_done, motion_task)
@@ -647,6 +652,7 @@ async def run_chat_turn(
     reuse_session_id: str | None = None,
     on_llm_error: Any | None = None,
     bus_service: Any | None = None,
+    turn_epoch: int | None = None,
 ) -> ChatTurnResult:
     """在已有用户侧文本后执行 LLM + TTS/pb 管道（应用层，不依赖 WebSocket 类型）。"""
     result = ChatTurnResult()
@@ -743,7 +749,7 @@ async def run_chat_turn(
             # 派生后台任务即刻返回：工具轮不等过渡语播完（边干活边说）
             _spawn_interim_tts(
                 downlink, chat, text, tts_prefetch, request_id=request_id, device_id=device_id, round_idx=round_idx,
-                device_ws=device_ws,
+                device_ws=device_ws, turn_epoch=turn_epoch,
             )
 
         llm_turn = await complete_llm_with_tool_loop(
@@ -881,6 +887,7 @@ async def run_chat_turn(
                         t_asr_start=t_asr_start,
                         motion_only=True,
                         device_ws=device_ws,
+                        turn_epoch=turn_epoch,
                     )
                 except Exception as pb_exc:
                     logger.exception("[LLM] need_reply=false 动作 pb 失败")
@@ -938,6 +945,7 @@ async def run_chat_turn(
                 auto_face_turn=True,
                 prefetch_tts=tts_prefetch.task,
                 device_ws=device_ws,
+                turn_epoch=turn_epoch,
             )
         except Exception as tts_exc:
             tts_prefetch.cancel()
@@ -967,6 +975,7 @@ async def run_chat_turn(
                 device_ws=device_ws,
                 t_asr_start=t_asr_start,
                 llm_exc=llm_exc,
+                turn_epoch=turn_epoch,
             )
         except Exception as fallback_exc:
             logger.exception("[LLM] 错误兜底 TTS/pb 失败 device_id=%s req=%s", device_id, request_id)
@@ -1031,6 +1040,7 @@ async def run_device_tts_only(
             t_asr_start=result.t_llm_end,
             device_ws=device_ws,
             task_level=task_level,
+            turn_epoch=turn_epoch,
         )
     except Exception as tts_exc:
         logger.exception("[device_tts] TTS 流程失败 device_id=%s", device_id)
@@ -1086,6 +1096,7 @@ async def run_device_playbook(
                     t_asr_start=result.t_llm_end or time.monotonic(),
                     motion_only=True,
                     device_ws=device_ws,
+                    turn_epoch=turn_epoch,
                 )
             except Exception as exc:
                 logger.exception("[scene_playbook] motion phase failed device_id=%s", device_id)
@@ -1125,8 +1136,13 @@ async def _send_pb_pairs(
     device_id: str,
     n_pb: int,
     task_level: int = PB_LEVEL_TASK,
+    turn_epoch: int | None = None,
 ) -> bool:
-    """下发一组 pb wire 帧。经 DeviceWsService 消息队列统一调度，返回是否因失败而中止。"""
+    """下发一组 pb wire 帧。经 DeviceWsService 消息队列统一调度，返回是否因失败而中止。
+
+    ``turn_epoch``：barge-in 轮代。本轮已被新语音打断时 send 会丢弃并返回 0，
+    这里即视为「中止」，上层循环随即 break —— 旧轮不再继续下发。
+    """
     from deskbot_server.model.pb_seq import PbSeq
 
     pb_seq = PbSeq.from_wire_pairs(pairs, level=task_level)
@@ -1134,7 +1150,7 @@ async def _send_pb_pairs(
         "[pb TX] enqueue device_id=%s req=%s level=%d blocks=%d",
         device_id, pb_seq.req, pb_seq.level, pb_seq.block_count,
     )
-    success = await device_ws.send(device_id, pb_seq, wait=True)
+    success = await device_ws.send(device_id, pb_seq, wait=True, turn_epoch=turn_epoch)
     if not success:
         logger.error("[pb TX] enqueue 失败 device_id=%s req=%s", device_id, pb_req)
     return not success
@@ -1155,6 +1171,7 @@ async def _run_pb_playback(
     prefetch_tts: asyncio.Task | None = None,
     device_ws: Any | None = None,
     task_level: int = PB_LEVEL_TASK,
+    turn_epoch: int | None = None,
 ) -> None:
     """下发 pb 音频/动作帧。
 
@@ -1279,7 +1296,8 @@ async def _run_pb_playback(
         logger.debug("[pb TX] 帧序一览 %s", json.dumps(frame_overview, ensure_ascii=False))
 
         pb_aborted = await _send_pb_pairs(
-            pairs=pairs, pb_req=pb_req, device_ws=device_ws, device_id=device_id, n_pb=n_pb, task_level=task_level,
+            pairs=pairs, pb_req=pb_req, device_ws=device_ws, device_id=device_id, n_pb=n_pb,
+            task_level=task_level, turn_epoch=turn_epoch,
         )
         if pb_aborted:
             if prefetch_tts_task is not None:
@@ -1307,7 +1325,9 @@ async def _run_pb_playback(
             from deskbot_server.model.pb_seq import PbBlock, PbSeq
             scene_blocks = [PbBlock.from_wire(f) for f in sframes]
             scene_seq = PbSeq(req=sreq, entries=tuple(scene_blocks), level=PB_LEVEL_DEBUG)
-            await device_ws.send(device_id, scene_seq)
+            # scenes 是调试级（level=3）追加下发，同样要带轮代：
+            # 否则旧轮被 barge-in 后，它的 LLM 场景仍会盖在新回答上
+            await device_ws.send(device_id, scene_seq, turn_epoch=turn_epoch)
             n_scene_pb += len(scene_blocks)
 
     if audio_parts and request_id and device_id and audio_parts_sr:
