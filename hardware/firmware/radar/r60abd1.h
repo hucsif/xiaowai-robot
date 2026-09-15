@@ -45,9 +45,13 @@ typedef struct {
     bool     presence;        /* 有人/无人 */
     uint8_t  motion;          /* 0 无 / 1 静止 / 2 活动 */
     uint8_t  body_move;       /* 体动幅度 0~100 */
-    /* distance_cm 已弃用——改用 DP5 x/y 判断位移 */
-    int16_t  x_cm;            /* DP5 人体X坐标 cm */
-    int16_t  y_cm;            /* DP5 人体Y坐标 cm */
+    /* distance_cm 已弃用（解析处 #if 0） */
+    /* x_cm / y_cm 已停用：本板的位置判据改用 LD2450 的坐标（见 radar.cpp
+     * 的 on_ld2450_frame），DP5 解析已在 r60abd1.c 里 #if 0。
+     * 保留字段是为了 struct 布局与上游保持一致，便于日后同步；
+     * 停用后这两个字段恒为 0，不要再改判据去读它们。 */
+    int16_t  x_cm;            /* 【已停用】恒为 0 */
+    int16_t  y_cm;            /* 【已停用】恒为 0 */
     uint8_t  breath_rate;     /* 呼吸率 次/分（0=无效） */
     uint8_t  heart_rate;      /* 心率 次/分（0=无效） */
     bool     in_bed;          /* 在床/离床 */

@@ -48,13 +48,18 @@ static void apply_frame(r60_parser_t *p, uint32_t now_ms)
         else if (cmd == R60_CMD_DISTANCE && len >= 2)
             s->distance_cm = ((uint16_t)d[0] << 8) | d[1];
 #endif
-        /* DP5 x/y 用于蹲下位移判断 */
+        /* DP5 x/y 已停用——位置改用 LD2450 的 10Hz 坐标（见 radar.cpp 的
+         * on_ld2450_frame）。R60 的 DP5 上报频率远低于 LD2450，本板的蹲下
+         * 检测需要更平滑的位置数据。停用后 s->x_cm / s->y_cm 恒为 0；
+         * 保留代码以备回退（与上面 distance_cm 同样的处理方式）。 */
+#if 0
         else if (cmd == R60_CMD_POSITION && len >= 4) {
             uint16_t raw_x = ((uint16_t)d[0] << 8) | d[1];
             uint16_t raw_y = ((uint16_t)d[2] << 8) | d[3];
             s->x_cm = (raw_x & 0x8000) ? -((int16_t)(raw_x & 0x7FFF)) : (int16_t)(raw_x & 0x7FFF);
             s->y_cm = (raw_y & 0x8000) ? -((int16_t)(raw_y & 0x7FFF)) : (int16_t)(raw_y & 0x7FFF);
         }
+#endif
     } else if (ctl == R60_CTL_BREATH) {
         if (cmd == R60_CMD_BREATH_VAL && len >= 1)  s->breath_rate = d[0];
     } else if (ctl == R60_CTL_SLEEP) {
