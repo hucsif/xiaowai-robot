@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from deskbot_server.pb.shapes import enumerate_zh_phonemes, normalize_primitive_shape
-from deskbot_server.pb.wire import build_pb_wire_pairs
+from deskbot_server.pb.wire import _PB_TAIL_SILENCE_MS, build_pb_wire_pairs
 from deskbot_server.service.application.camera_frame import (
     analyze_face_detection,
     analyze_face_detections,
@@ -261,3 +261,52 @@ def test_build_pb_wire_pairs_empty_segs_raises():
         assert False, "expected ValueError"
     except ValueError:
         pass
+
+
+def _pcm(ms: int, sr: int = 24000) -> bytes:
+    return b"\x00" * (sr * ms // 1000 * 2)
+
+
+def _mouth_heights(anim_item: dict) -> list[int]:
+    return [
+        int(p.get("h"))
+        for p in anim_item["elements"]["mouth"]
+        if isinstance(p, dict) and p.get("shape") == "round_rect" and p.get("h") is not None
+    ]
+
+
+def test_pb_tail_closes_mouth_after_last_phoneme():
+    """TTS 音素序列止于最后一个音素，没有尾静音 → 「回答完了嘴还张着」。
+
+    ``build_pb_wire_pairs`` 现在会在末尾补一段 ``sil`` 静音片，让屏上最后一帧是
+    闭嘴口型。这里钉住三件事：末尾确实多了一帧、它是 ``sil``、且嘴比最后一个
+    元音窄。
+    """
+    segs = [
+        {"phoneme": "n", "ms": 100, "pcm": _pcm(100)},
+        {"phoneme": "a", "ms": 140, "pcm": _pcm(140)},  # 大张口，原来是最后一帧
+    ]
+    pairs, _req, _n, _sr = build_pb_wire_pairs(segs, {}, sample_rate=24000)
+    anim = [a for msg, _bins in pairs for a in msg["anim"]]
+
+    assert anim[-1].get("phoneme") == "sil"
+    assert anim[-1]["ms"] == _PB_TAIL_SILENCE_MS
+
+    # 时长总和 = 音素合计 + 收尾
+    assert sum(int(a["ms"]) for a in anim) == 240 + _PB_TAIL_SILENCE_MS
+
+    last_vowel_h = max(_mouth_heights(anim[-2]))  # "a"：张口
+    tail_h = max(_mouth_heights(anim[-1]))        # sil：闭嘴
+    assert tail_h < last_vowel_h, f"收尾口型 {tail_h} 应比最后元音 {last_vowel_h} 窄"
+
+
+def test_pb_tail_can_be_disabled(monkeypatch):
+    """置 0 关闭收尾：末帧应停在最后一个音素上（老行为）。"""
+    from deskbot_server.pb import wire as wire_mod
+
+    monkeypatch.setattr(wire_mod, "_PB_TAIL_SILENCE_MS", 0)
+    segs = [{"phoneme": "a", "ms": 140, "pcm": _pcm(140)}]
+    pairs, _req, _n, _sr = wire_mod.build_pb_wire_pairs(segs, {}, sample_rate=24000)
+    anim = [a for msg, _bins in pairs for a in msg["anim"]]
+    assert [a.get("phoneme") for a in anim] == ["a"]
+    assert sum(int(a["ms"]) for a in anim) == 140

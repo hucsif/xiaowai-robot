@@ -21,6 +21,7 @@ from deskbot_server.pb.phoneme_anim import phoneme_seq_to_anim_seq
 from deskbot_server.pb.servo_pcm import (
     PB_ACTION_REPLACE,
     PB_CHUNK_MS_MAX,
+    _silence_phoneme_seg,
     align_pcm_s16le_mono_to_chunk_ms,
     apply_parallel_pb_servo,
     apply_random_pb_servo_actions,
@@ -31,6 +32,12 @@ from deskbot_server.pb.servo_pcm import (
 )
 
 logger = logging.getLogger("deskbot-server")
+
+# 收尾闭口片时长（ms）。TTS 的音素序列**止于最后一个音素**，没有尾静音，所以
+# 「回答完了嘴还张着」——屏上一直留着最后一个音素的口型。补一段极短静音片，
+# 其音素取 ``sil``，在两条口型查找路径里都落到闭嘴口型（``closed_h = 4``）。
+# 调大 = 闭嘴动作更从容；置 0 = 关闭收尾。
+_PB_TAIL_SILENCE_MS = 200
 
 
 def pb_wire_json_bytes(payload: dict[str, Any]) -> int:
@@ -95,10 +102,17 @@ def build_pb_wire_pairs(
     if leading_n > len(move_steps):
         leading_n = len(move_steps)
 
+    # 收尾闭口：末尾补一段静音片，让屏上最后一帧是闭嘴而不是最后一个音素的口型。
+    # ⚠️ 必须在这里追加（而不是等 anim_rows 建好之后）—— 下游
+    #    interleave_tts_segs_with_llm_plan 与 build_anim_rows_for_llm_plan 都按
+    #    segs 的下标对齐，事后追加会让 parallel_anim 与 segs 长度错位。
+    if _PB_TAIL_SILENCE_MS > 0 and segs:
+        tail = _silence_phoneme_seg(_PB_TAIL_SILENCE_MS, sample_rate)
+        tail["phoneme"] = "sil"
+        segs = list(segs) + [tail]
+
     if move_steps or anim_frames:
         if leading_n > 0:
-            from deskbot_server.pb.servo_pcm import _silence_phoneme_seg
-
             prefix_segs = [
                 _silence_phoneme_seg(max(40, int(move_steps[i].get("ms", 40))), sample_rate) for i in range(leading_n)
             ]
