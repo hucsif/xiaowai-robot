@@ -15,6 +15,7 @@ class _DeviceCounts:
     audio: int = 0
     ack: int = 0
     camera: int = 0
+    radar: int = 0
 
 
 _counts: dict[str, _DeviceCounts] = defaultdict(_DeviceCounts)
@@ -59,6 +60,14 @@ def note_uplink_camera(device_id: str | None) -> None:
     _counts[k].camera += 1
 
 
+def note_uplink_radar(device_id: str | None) -> None:
+    """雷达状态包。排障「雷达工具说读不到」时先看这个数在不在涨。"""
+    ensure_uplink_rate_stats_started()
+    k = _key(device_id)
+    _known.add(k)
+    _counts[k].radar += 1
+
+
 def remove_device(device_id: str | None) -> None:
     """设备断开时清理，停止为该设备打印心跳。"""
     k = _key(device_id)
@@ -75,7 +84,8 @@ async def _ticker() -> None:
             continue
         # 已知设备每秒都打点（含 0），避免把「每 8s 一包」误读成「每秒 1～2 包」。
         parts = [
-            f"{device_id}:audio={snap[device_id].audio} ack={snap[device_id].ack} cam={snap[device_id].camera}"
+            f"{device_id}:audio={snap[device_id].audio} ack={snap[device_id].ack} "
+            f"cam={snap[device_id].camera} radar={snap[device_id].radar}"
             for device_id in sorted(_known)
         ]
         logger.debug("[uplink/1s] %s", " | ".join(parts))

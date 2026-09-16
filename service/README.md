@@ -120,6 +120,7 @@ TTS 默认使用独立进程 MOSS-TTS-Nano（`tts.provider: moss-tts-nano`，需
 |-------------|--------|------|
 | `audio` + `next_bin_len` | Opus 或 PCM | 语音流；段结束发 `flush` 触发识别与回复 |
 | `camera_frame` + `next_bin_len` | JPEG | 可选；人脸检测与调试预览 |
+| `radar_state` | 无 | 可选；雷达快照（心率/呼吸/人的方位），1Hz。**不触发对话**，只供 `get_heart_rate` / `get_breath_rate` / `get_radar_position` 工具读取；开关见固件 `DESKBOT_RADAR_UPLINK_ENABLE` |
 | `pb_ack` | 无 | 播放缓冲回压 |
 | `ping` | 无 | 保活 |
 

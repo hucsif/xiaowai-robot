@@ -94,12 +94,18 @@ def _wipe_files(device_id: str) -> dict[str, Any]:
 
 def _wipe_caches(device_id: str) -> None:
     """清除每设备内存缓存；放最后，读方在清库期间重新填充的也会被一并清掉。"""
-    from deskbot_server.service.application import face_snapshot_cache, interaction_feedback, voice_snapshot_cache
+    from deskbot_server.service.application import (
+        face_snapshot_cache,
+        interaction_feedback,
+        radar_snapshot_cache,
+        voice_snapshot_cache,
+    )
     from deskbot_server.service.application.convo_audio_store import ConvoAudioStore
 
     ConvoAudioStore().clear(device_id)
     voice_snapshot_cache.clear_device(device_id)
     face_snapshot_cache.clear_device(device_id)
+    radar_snapshot_cache.clear_device(device_id)
     interaction_feedback.clear_face_analysis(device_id)
 
 

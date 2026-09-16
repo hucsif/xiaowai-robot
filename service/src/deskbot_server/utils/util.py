@@ -71,6 +71,33 @@ def _normalize_incoming_pb_ack(data: dict[str, Any]) -> dict[str, Any] | None:
     return out
 
 
+def _normalize_incoming_radar(data: dict[str, Any]) -> dict[str, Any] | None:
+    """校验 ESP32 上行的 ``radar_state``（雷达快照），供按设备缓存与 LLM 工具读取。
+
+    字段强转/范围判断全在这一个函数里，分派分支保持极薄（与
+    ``_normalize_incoming_pb_ack`` 同构）。
+
+    无效字段【直接不带这个键】而不是填 0：0 在协议里就是「无效」，
+    填 0 会让下游分不清「没目标 / 测不到」与「值恰好是 0」。
+    """
+    if not isinstance(data, dict) or data.get("type") != "radar_state":
+        return None
+    out: dict[str, Any] = {"type": "radar_state", "present": bool(data.get("present"))}
+    for key in ("x_mm", "y_mm"):
+        try:
+            out[key] = int(data[key])
+        except (KeyError, TypeError, ValueError):
+            pass
+    for key in ("heart_rate", "breath_rate"):
+        try:
+            val = int(data[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if val > 0:
+            out[key] = val
+    return out
+
+
 def _new_request_id() -> str:
     """生成 /asr_chat 每一轮的 request_id（短 uuid），用于跨阶段追踪。"""
     return uuid.uuid4().hex[:16]

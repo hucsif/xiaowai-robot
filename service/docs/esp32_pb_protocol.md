@@ -98,7 +98,30 @@ websocket_connect(url);
 
 下一条为 JPEG。下行 pb 可用 **`cam_fps`**（如 `3` = 每秒 3 帧）调节上行帧率；发送侧建议丢旧保新。
 
-### 2.3 其它
+### 2.3 雷达 `radar_state`
+
+设备 1Hz 上报的雷达快照（心跳/呼吸/人的方位）。**纯 JSON，无 binary**。
+
+```json
+{ "type": "radar_state", "present": true, "x_mm": -450, "y_mm": 1180,
+  "heart_rate": 72, "breath_rate": 16 }
+```
+
+| 字段 | 单位 | 说明 |
+|------|------|------|
+| `present` | bool | LD2450 是否检到目标（运动追踪，人极静时可能丢） |
+| `x_mm` | mm | 横向；**负 = 机器人左侧**（已按固件 `DESKBOT_RADAR_X_SIGN` 规范化） |
+| `y_mm` | mm | 前方距离 |
+| `heart_rate` / `breath_rate` | 次/分 | R60ABD1；**缺失表示测不到**（不是 0） |
+
+缺失的字段整个省略而非填 0 —— `0` 在协议里就是「无效」，填 0 会分不清
+「测不到」与「值恰好是 0」。速度上限受固件 `RADAR_UPLINK_INTERVAL_MS` 控制，
+**勿提到 10Hz**：与本条 WS 上的音频共用同一条 TX 队列。
+
+**上行本身不触发任何对话轮次** —— 服务端只把它写进按设备的缓存
+（`radar_snapshot_cache`），等 LLM 调用 `get_heart_rate` / `get_breath_rate` / `get_radar_position` 工具时再读出来。
+
+### 2.4 其它
 
 | `type` | 说明 |
 |--------|------|

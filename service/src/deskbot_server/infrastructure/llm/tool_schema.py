@@ -181,6 +181,82 @@ def _user_social_schemas() -> list[dict[str, Any]]:
     ]
 
 
+# ───────────────────── 雷达状态（按设备能力注册）─────────────────────
+
+# 三个雷达工具共用的「笼统提问」补丁。
+# 拆成三个单值工具解决了「问心率却把呼吸方位一起念」和「问呼吸却报心率」，
+# 但带来了相反方向的失效：笼统地问「我现在怎么样」时，模型只挑一个匹配度最高的
+# 调用（实测挑中心率），因为三个工具里**没有「全都要」这个选项**。
+# 「用户问的是某项还是笼统问整体」这个判断只能在 prompt 里引导 —— 结构上锁不住。
+_RADAR_BROAD_HINT = (
+    "用户**笼统**地问整体状态/身体情况、没指明具体哪一项时（如「我现在怎么样」「我的状态」），"
+    "三个雷达工具都要调用（本工具 + 另外两个），不要只调本工具报一项。"
+)
+
+
+def _radar_schemas(*, device_id: str | None = None) -> list[dict[str, Any]]:
+    """雷达感知：**每个工具只回答一件事，按「用户问了什么」拆开**。
+
+    ``get_heart_rate`` / ``get_breath_rate`` / ``get_radar_position`` 三个零参工具，
+    而不是一个（或两个）工具返回多个字段。实测过两轮，这条经验很硬：
+
+    - 一个工具返回 ``{where, distance_m, heart_rate, breath_rate}`` → 模型把四个
+      数值**一起念出来**；
+    - 缩成一个返回心率+呼吸的 ``get_radar_vitals`` → 模型**问呼吸却报心率**
+      （两个值都在上下文里，它挑了错的那个）。
+
+    拆开之后「用户问了什么」被编码进「调了哪个工具」：没被问到的数据**根本不进
+    上下文**，模型既没法顺带报、也没法挑错。这比在 description 里写「别全说」
+    硬得多 —— 后者只是软约束，本地小模型经常不遵守。
+
+    只在**该设备确实上报过** ``radar_state`` 时才产出 —— 没接雷达（或固件侧
+    ``DESKBOT_RADAR_UPLINK_ENABLE=0``）的设备不该看到一堆注定查不出东西的工具。
+    判定见 ``radar_snapshot_cache.has_device_radar``。
+
+    零参数建模：文件头注释提到的「本地小模型对嵌套/多参 schema 遵循率差」同样适用，
+    这里干脆零参，模型只需判断「该不该查、查哪一个」。description 里还刻意互相
+    点名（「呼吸率是另一个工具，不要拿它替代」），堵住拿近邻数值顶替的路。
+    """
+    from deskbot_server.service.application.radar_snapshot_cache import has_device_radar
+
+    if not has_device_radar(device_id):
+        return []
+    return [
+        _fn(
+            "get_heart_rate",
+            "读取用户当前的心率（次/分，雷达生理感知）。"
+            "**用户问自己的心跳/心率时必须调用本工具**，禁止凭记忆或猜测回答。"
+            "呼吸率是另一个工具 get_breath_rate —— 用户问呼吸时不要用本工具、"
+            "也不要用这里的心率数值去顶替。"
+            "返回里缺 heart_rate 表示当前测不到，如实说明即可，不要编造数值。"
+            + _RADAR_BROAD_HINT,
+            [],  # 无参数
+            {},
+        ),
+        _fn(
+            "get_breath_rate",
+            "读取用户当前的呼吸率（次/分，雷达生理感知）。"
+            "**用户问自己的呼吸/呼吸频次/喘气时必须调用本工具**，禁止凭记忆或猜测回答。"
+            "心率是另一个工具 get_heart_rate —— 用户问心率时不要用本工具、"
+            "也不要用这里的呼吸数值去顶替。"
+            "返回里缺 breath_rate 表示当前测不到，如实说明即可，不要编造数值。"
+            + _RADAR_BROAD_HINT,
+            [],  # 无参数
+            {},
+        ),
+        _fn(
+            "get_radar_position",
+            "读取用户相对机器人的方位与距离（雷达运动追踪）。"
+            "**用户问自己在哪里/在什么方位/离机器人多远时必须调用本工具**，禁止凭记忆或猜测回答。"
+            "**只回答方位与距离**，不要顺带报心率/呼吸。"
+            "返回里缺 where 表示雷达暂时没检到人（人极静时运动雷达可能丢），如实说明。"
+            + _RADAR_BROAD_HINT,
+            [],  # 无参数
+            {},
+        ),
+    ]
+
+
 def _say_schema() -> dict[str, Any]:
     """工具轮过渡语工具：与其它工具**同时**调用，服务端顺带播报一句口语。
 
@@ -209,8 +285,14 @@ def build_native_tool_schemas(
     batch1 = 纯函数六工具；batch2 = 人脸/声纹注册 + 剧情任务（无 running 任务时
     quest 工具不产出；任务 id/类型动态注入 description，不进 parameters enum）；
     batch3（随 batch2 开关）= 用户社交按人归档两工具，恒在；
+    批次内还有三个雷达感知工具（get_heart_rate / get_breath_rate / get_radar_position，
+    仅该设备上报过雷达数据时产出）；
     batch4 = ``say`` 过渡语工具，仅首轮工具轮产出（``is_tool_round=True``），
     恒排在末尾——batch1 前缀顺序与集合不受影响。
+
+    ⚠️ 顺序约束（有测试盯着）：新工具一律追加在 ``_batch1_schemas()`` 之外、
+    ``include_batch2`` 之内、``say`` 的 append **之前**——batch1 是被精确断言的
+    六个名字，而 ``say`` 必须保持末位。
     """
     schemas = _batch1_schemas()
     if include_batch2:
@@ -223,6 +305,7 @@ def build_native_tool_schemas(
                 quest_tasks = calls[0].get("tasks") or []
         schemas += _batch2_schemas(device_id=device_id, quest_tasks=quest_tasks)
         schemas += _user_social_schemas()
+        schemas += _radar_schemas(device_id=device_id)
     if is_tool_round:
         schemas.append(_say_schema())
     return schemas

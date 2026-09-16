@@ -1041,6 +1041,24 @@ class DeviceWsService(metaclass=SingletonMeta):
                                 await self.record_pb_ack(device_id, norm)
                             continue
 
+                        if msg_type == "radar_state":
+                            # 设备 1Hz 的雷达快照。只写进按设备缓存，**不触发任何对话轮次**
+                            # （与 pb_ack 同构）：LLM 调用 get_heart_rate / get_breath_rate / get_radar_position 工具时才读出来。
+                            from deskbot_server.service.application.radar_snapshot_cache import (
+                                update_device_radar,
+                            )
+                            from deskbot_server.utils.util import _normalize_incoming_radar
+                            from deskbot_server.ws.uplink_rate_stats import note_uplink_radar
+
+                            norm = _normalize_incoming_radar(data)
+                            if norm is not None and device_id:
+                                # 纯内存写、无 await —— 不阻塞 RX 循环。
+                                # 刻意不调 touch()：在线判据已有 audio / pb_ack 覆盖，
+                                # 雷达只是附加心跳，省一次 self._lock 争用。
+                                update_device_radar(device_id, norm)
+                                note_uplink_radar(device_id)
+                            continue
+
                         logger.debug("[/asr_chat] 未知打包帧 type=%r device_id=%s", msg_type, device_id)
                         continue
 

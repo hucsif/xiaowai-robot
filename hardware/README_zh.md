@@ -53,6 +53,8 @@
 
 后台见 [`../service/`](../service/)。固件 WebSocket：**`/asr_chat`**。摄像头 JPEG 经同一 WS 上行（`camera_frame`）；STA 正常运行后**没有**常驻本机摄像头网页（仅配网 AP 门户）。服务端调试预览：`/camera_view`。
 
+两路雷达（R60ABD1 呼吸睡眠 + LD2450 运动追踪）除了打串口日志，还会按 1Hz 把一份快照上行给服务端（`radar_state`：心率/呼吸/人的方位），供 LLM 的 `get_heart_rate` / `get_breath_rate` / `get_radar_position` 工具读取——**上行不触发任何对话**。开关与周期见 [`firmware/radar/radar_config.h`](firmware/radar/radar_config.h) 的 `DESKBOT_RADAR_UPLINK_ENABLE` / `RADAR_UPLINK_INTERVAL_MS`；心率属健康类敏感信息，不想外发就置 0。
+
 Arduino 3.x 的 WiFi write timeout 补丁优先改 `NetworkClient.cpp`（见 `scripts/`）。
 
 ---

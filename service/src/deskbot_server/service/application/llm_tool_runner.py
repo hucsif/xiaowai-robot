@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from deskbot_server.dao.device_memory_mapper import add_memory, delete_memory
 from deskbot_server.dao.device_session_mapper import execute_session_tool
 from deskbot_server.dao.user_social_store import append_daily_task_line, append_user_info_line
 from deskbot_server.service.application.face_registration import register_face_for_device
+from deskbot_server.service.application.radar_snapshot_cache import get_device_radar
 from deskbot_server.service.application.voice_registration import register_voice_for_device
 from deskbot_server.service.camera_face_service import capture_camera_for_device_async
 from deskbot_server.service.miot_tools import execute_miot_tool
@@ -24,6 +26,46 @@ _NAME_KEYS = ("user_name", "person_name", "user", "person", "name")
 _MESSAGE_KEYS = ("chat_message", "message", "content", "text", "msg")
 _REASON_KEYS = ("reason", "result", "cause", "note", "description", "text", "msg")
 _IDENT_KEYS = frozenset({"tool", "type", "function", "id", "arguments", "tool_call_id"}) | set(_NAME_KEYS) | set(_MESSAGE_KEYS)
+
+
+# 雷达感知工具：工具名 → 快照里对应的字段键（方位工具字段不止一个，走单独分支）。
+# 三个工具各自**只返回一项** —— 合并返回时实测模型会「问呼吸却报心率」，
+# 详见 tool_schema._radar_schemas 的说明。
+_RADAR_TOOLS: dict[str, str] = {
+    "get_heart_rate": "heart_rate",
+    "get_breath_rate": "breath_rate",
+    "get_radar_position": "",  # 单独分支，不走 key 映射
+}
+_RADAR_TOOLS_CN: dict[str, str] = {
+    "get_heart_rate": "心率",
+    "get_breath_rate": "呼吸率",
+    "get_radar_position": "方位",
+}
+
+# 方位措辞的角度分档（与固件 look_angle_provider 用同一套 atan2(|x|, y) 几何）
+_RADAR_FRONT_DEG = 15.0
+_RADAR_SIDE_DEG = 45.0
+
+
+def _radar_where_text(x_mm: Any, y_mm: Any) -> str | None:
+    """``(x_mm, y_mm)`` → 「正前方 / 左前方 / 左侧」；坐标不可用返回 None。
+
+    线上契约：**x_mm 为负 = 机器人左侧**（固件已按 ``DESKBOT_RADAR_X_SIGN``
+    规范化后才上行）。若实测左右说反了，去改固件那个宏，**不要在这里翻** ——
+    否则线上契约就变成两处各自为政了。
+    """
+    try:
+        x = int(x_mm)
+        y = int(y_mm)
+    except (TypeError, ValueError):
+        return None
+    if y <= 0:
+        return None  # 目标在正侧/身后：此时 atan2 会给出无意义的大角，不猜
+    ang = math.degrees(math.atan2(abs(x), y))
+    if ang <= _RADAR_FRONT_DEG:
+        return "正前方"
+    side = "左" if x < 0 else "右"
+    return f"{side}前方" if ang <= _RADAR_SIDE_DEG else f"{side}侧"
 
 
 def _require_quest_playbook(device_id: str) -> str:
@@ -144,6 +186,40 @@ async def execute_llm_tools(
             elif tool == "session":
                 out = execute_session_tool(raw, device_id=dev)
                 results.append(out)
+            elif tool in _RADAR_TOOLS:
+                # 三个工具**刻意各自只返回一项**，让「用户问了什么」决定上下文里
+                # 有什么 —— 模型既没法顺带报、也没法拿近邻数值顶替（见
+                # tool_schema._radar_schemas 的说明与那里记录的两次实测）。
+                if not dev:
+                    raise ValueError(f"{tool} 需要 device_id")
+                snap = get_device_radar(dev)
+                if snap is None:
+                    results.append(
+                        {"tool": tool, "ok": False, "error": "雷达数据已过期或不可用（设备可能离线）"}
+                    )
+                elif tool == "get_radar_position":
+                    row: dict[str, Any] = {"tool": tool, "ok": True, "present": bool(snap.get("present"))}
+                    where = _radar_where_text(snap.get("x_mm"), snap.get("y_mm"))
+                    if where:
+                        row["where"] = where
+                        row["distance_m"] = round(
+                            math.hypot(snap["x_mm"], snap["y_mm"]) / 1000.0, 1
+                        )
+                    results.append(row)
+                else:
+                    # 生命体征与方位无关：LD2450 是运动追踪雷达，人坐得极静时可能
+                    # 丢目标，而 R60 的生命体征仍然有效 —— 所以不看 present。
+                    # 这个 dict 会被 chat_flow 用 json.dumps 原样塞进 role="tool"
+                    # 消息 —— 就是 LLM 看到的原文，字段名要自解释。
+                    key = _RADAR_TOOLS[tool]
+                    row = {"tool": tool, "ok": True}
+                    if snap.get(key):
+                        row[key] = snap[key]
+                    else:
+                        # 显式说明「测不到」，别只留个空对象 —— 否则模型容易拿
+                        # 上下文里的另一个数值来凑答案。
+                        row["note"] = f"当前测不到{_RADAR_TOOLS_CN[tool]}，请如实告诉用户"
+                    results.append(row)
             elif tool == "complete_task":
                 playbook = _require_quest_playbook(dev)
                 task_id = str(raw.get("task_id") or "").strip()

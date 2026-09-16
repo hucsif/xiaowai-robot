@@ -1,12 +1,22 @@
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "radar_config.h"
 
 /* 雷达采集模块对外接口（R60ABD1 60GHz 呼吸睡眠 + LD2450 24GHz 运动追踪）。
  *
- * 本模块只做「采集 + 解析 + 日志」：初始化两路 UART，把原始字节喂给两个
- * 纯 C 解析器，并按周期把解析结果打到串口，用于验证接线与观察实时数据。
- * 不含姿态/睡眠等业务状态机，也不做任何网络上报。
+ * 本模块只做「采集 + 解析 + 日志 + 状态上行」：初始化两路 UART，把原始字节喂给
+ * 两个纯 C 解析器，按周期把解析结果打到串口，并用 radar_snapshot() 对外暴露一份
+ * 实时快照。不含姿态/睡眠等业务状态机。
+ *
+ * 网络上报只做一件事（开关见 radar_config.h 的 DESKBOT_RADAR_UPLINK_ENABLE）：
+ * 按 RADAR_UPLINK_INTERVAL_MS 把 radar_snapshot() 打包成一条 radar_state JSON
+ * 交 ws_transport_enqueue_state() 上行（走主连接 /asr_chat）。方向是**单向**的
+ * ——本模块只发不收，不解析任何服务端语义，也不做下行控制。
+ * 上行本身【不触发任何对话轮次】：服务端收到后只写进按设备的缓存，等 LLM 调用
+ * get_heart_rate / get_breath_rate / get_radar_position 工具时再读出来。
  *
  * 日志级别说明：本固件运行期日志级别固定为 WARN（log_info 是空操作），
  * 因此这里所有输出都用 log_warn，标签为 [RADAR] / [RADAR/R60] / [RADAR/LD2450]。
@@ -87,3 +97,25 @@ bool setup_radar();
 
 /** 创建雷达采集任务（幂等）：10ms 轮询两路 UART，按 RADAR_LOG_INTERVAL_MS 输出摘要。 */
 void task_setup_radar();
+
+/* ================================================================
+ * 实时快照（供上行与其它业务模块读取）
+ * ================================================================ */
+
+/** 雷达实时快照。
+ *
+ * ⚠️ 各字段是「各自最近一次解析结果」，**不是同一时刻的原子快照** —— 两路雷达
+ *    上报频率差很多（心率/呼吸 3s 一帧、LD2450 10Hz），字段间有秒级时间差。
+ *
+ * 参考系：方位相对**机身正前方**（LD2450 固定装在身体/底座，不随舵机转动）。 */
+typedef struct {
+  bool    present;     /* LD2450 是否检到目标（运动追踪，人极静时可能丢） */
+  int16_t x_mm;        /* 横向 mm；**负 = 机器人左侧**（已按 DESKBOT_RADAR_X_SIGN 规范化） */
+  int16_t y_mm;        /* 前方距离 mm */
+  uint8_t heart_rate;  /* R60 心率 次/分；0 = 未知（含超 RADAR_VITAL_TTL_MS 未更新） */
+  uint8_t breath_rate; /* R60 呼吸率 次/分；0 = 未知 */
+} radar_snapshot_t;
+
+/** 取一份当前快照（值语义，不返回内部指针——避免把解析器状态泄给其它任务）。
+ *  雷达未启动（setup_radar 未调用）时返回全零快照。 */
+radar_snapshot_t radar_snapshot(void);

@@ -100,3 +100,50 @@
 #ifndef DESKBOT_LOOK_MAX_DIST_MM
 #define DESKBOT_LOOK_MAX_DIST_MM 3000
 #endif
+
+/* ========== 雷达状态上行（radar_state → 服务端 LLM 工具）==========
+ * 按 RADAR_UPLINK_INTERVAL_MS 把 radar_snapshot() 打成一条 JSON 交给
+ * ws_transport_enqueue_state()（走主连接 /asr_chat）。服务端只把它写进按设备
+ * 的缓存，LLM 调用 get_heart_rate / get_breath_rate / get_radar_position 工具时读出来 —— 上行本身【不触发任何
+ * 对话轮次】，与 pb_ack 同构（写缓存后 continue）。
+ *
+ * 隐私：心率属健康类敏感信息，开了这个开关就意味着它离开设备、进入服务端内存
+ * 与第三方 LLM 的上下文。不想给就置 0。
+ */
+
+/* 总开关：置 0 = 完全不上行（服务端也就不会注册 get_heart_rate / get_breath_rate / get_radar_position 工具）。 */
+#ifndef DESKBOT_RADAR_UPLINK_ENABLE
+#define DESKBOT_RADAR_UPLINK_ENABLE 1
+#endif
+
+/* 上报周期（ms）。1Hz 约 140 B/s，带宽可忽略。
+ * ⚠️ 勿为了「更实时」提到 10Hz —— 上行与音频共用同一条 32 深的 TX 队列
+ *    （ws_transport.cpp），满即丢弃且无优先级，10Hz 会真去挤音频。 */
+#ifndef RADAR_UPLINK_INTERVAL_MS
+#define RADAR_UPLINK_INTERVAL_MS 1000
+#endif
+
+/* 心率/呼吸的新鲜度上限（ms）。R60 是 3 秒一帧，容忍连续几次没更新；
+ * 超时后该字段从 JSON 里【整个省略】（而不是发 0 —— 0 在协议里就是「无效」）。 */
+#ifndef RADAR_VITAL_TTL_MS
+#define RADAR_VITAL_TTL_MS 12000
+#endif
+
+/* 方位窗口（mm）。刻意与 DESKBOT_LOOK_* 同口径 —— 让「LLM 说的方位」与
+ * 「头实际转过去的方向」取同一个目标，两处不一致会显得精神分裂。 */
+#ifndef DESKBOT_RADAR_MIN_DIST_MM
+#define DESKBOT_RADAR_MIN_DIST_MM 200
+#endif
+#ifndef DESKBOT_RADAR_MAX_DIST_MM
+#define DESKBOT_RADAR_MAX_DIST_MM 3000
+#endif
+
+/* 横向坐标符号标定：把线上契约固定为「负 = 机器人左侧」。
+ * ⚠️ 必须实测一次 —— LD2450 数据手册说 x 左负右正，但实际装配朝向可能相反
+ *    （DESKBOT_LOOK_GAIN 就是为同一件事留的 -1.0f）。
+ *    标定：人站到机器人【左侧】，看串口上行日志里的 x_mm；
+ *          若 x_mm > 0（报成了右侧），把本宏改成 -1 重烧。
+ *    转头方向反了 → 改 DESKBOT_LOOK_GAIN；方位说反了 → 改这个。两件事同源。 */
+#ifndef DESKBOT_RADAR_X_SIGN
+#define DESKBOT_RADAR_X_SIGN 1
+#endif

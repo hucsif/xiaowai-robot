@@ -15,6 +15,8 @@
 #include <Arduino.h>
 #include <HardwareSerial.h>
 #include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -75,6 +77,16 @@ int s_prev_stage = -1;  /* 上次的睡眠分期 */
 uint32_t s_last_seat_tick = 0;
 /** WS 是否处于「已连接」的活动态；false 时采集/检测/日志全部暂停。 */
 bool s_ws_active = false;
+
+/* 心率/呼吸各自的新鲜度锚点（见 RADAR_VITAL_TTL_MS）。
+ * ⚠️ 不能用 r60_status()->last_update_ms 代替：r60abd1.c 对**每一帧**都盖那个
+ *    时间戳，心率 3 秒才一帧，但体动帧 1Hz 会把它一直刷新 → 永远判「新鲜」。 */
+uint32_t s_heart_ms = 0;
+uint32_t s_breath_ms = 0;
+/** 最近一次状态上行时刻（节流用）。 */
+uint32_t s_last_uplink_ms = 0;
+/** 上行失败是否已告警过，避免 1Hz 刷屏（同一模式见 log_silent_diag）。 */
+bool s_uplink_warned = false;
 
 /* ──────────────────────────────────────────────────────────────────────
  * 采集：非阻塞 drain
@@ -267,15 +279,28 @@ void log_summary(uint32_t now) {
  * 一帧就调用一次。分发条件与上游 caterpillar 的 glue.cc 保持一致。
  * ──────────────────────────────────────────────────────────────────── */
 
-/** R60 帧回调：只把体动幅度分发给蹲下 FSM。
+/** R60 帧回调：打心率/呼吸的新鲜度锚点 + 把体动幅度分发给蹲下 FSM。
  *  蹲下的「位置」判据已改由 LD2450 提供（见 on_ld2450_frame）——R60 的 DP5
- *  上报频率远低于 LD2450，不够平滑。DP5 的解析也已在 r60abd1.c 里 #if 0。 */
+ *  上报频率远低于 LD2450，不够平滑。DP5 的解析也已在 r60abd1.c 里 #if 0。
+ *
+ *  心率/呼吸帧本身已被解析器写进 r60_status_t（r60abd1.c），但**帧回调**原先
+ *  直接 return 掉它们，导致这里拿不到「它们各自什么时候更新过」——而 radar_snapshot()
+ *  要靠这个判断是否超 RADAR_VITAL_TTL_MS。所以先打点再按原逻辑过滤。 */
 void on_r60_frame(uint8_t ctl, uint8_t cmd, const uint8_t* /*data*/, uint16_t /*len*/,
                   void* /*user*/) {
+  const uint32_t now = millis();
+  if (ctl == R60_CTL_BREATH && cmd == R60_CMD_BREATH_VAL) {
+    s_breath_ms = now;
+    return;
+  }
+  if (ctl == R60_CTL_HEART && cmd == R60_CMD_HEART_VAL) {
+    s_heart_ms = now;
+    return;
+  }
   if (ctl != R60_CTL_PRESENCE || cmd != R60_CMD_BODYMOVE) {
     return; /* 只处理 0x80/0x03：体动幅度，1Hz */
   }
-  squat_on_body_move(&s_squat, r60_status(&s_r60)->body_move, millis());
+  squat_on_body_move(&s_squat, r60_status(&s_r60)->body_move, now);
 }
 
 /** LD2450 帧回调：取第一个有效且在 3m 内的目标喂挥手 FSM。 */
@@ -370,6 +395,14 @@ void resume_from_pause(uint32_t now) {
   s_prev_targets = -1;
   s_prev_bed = -1;
   s_prev_stage = -1;
+  /* 心率/呼吸锚点清零 = 「未知」。断线期间没有帧更新它们，若不重置，重连后
+   * 第一帧上行会带出断线前的陈旧心率（radar_snapshot 的 TTL 判据会算成新鲜）。 */
+  s_heart_ms = 0;
+  s_breath_ms = 0;
+  /* 上行节流重新计时：不沿用断线前的锚点，重连后 1s 才发第一条
+   * （此刻快照里的心率/呼吸已因上面清零而变成「未知」，早发也没意义）。 */
+  s_last_uplink_ms = now;
+  s_uplink_warned = false;
 }
 
 /* ──────────────────────────────────────────────────────────────────────
@@ -473,6 +506,80 @@ void maybe_recenter(uint32_t now) {
 }
 #endif /* DESKBOT_LOOK_ENABLE */
 
+/* ──────────────────────────────────────────────────────────────────────
+ * 状态上行（radar_state → 服务端 LLM 工具 get_heart_rate / get_breath_rate / get_radar_position）
+ *
+ * 只发一条 JSON，服务端收到后写进「按设备」的缓存，等 LLM 调工具时再读出来。
+ * 上行本身【不触发任何对话轮次】——服务端的分派分支只写缓存然后 continue，
+ * 与 pb_ack 同构。开关见 radar_config.h 的 DESKBOT_RADAR_UPLINK_ENABLE。
+ *
+ * ⚠️ 必须在 task_loop_radar 的 ws_transport_ready() 门控【之后】调用：
+ *    ws_transport_enqueue_state() 不像 enqueue_audio 那样自己检查链路
+ *    （ws_transport.cpp），断线时条目会堆满 32 深的 TX 队列再被丢。
+ * ──────────────────────────────────────────────────────────────────── */
+
+#if DESKBOT_RADAR_UPLINK_ENABLE
+/** 追加式格式化：满了就停，绝不越界（截断时钉在 cap，buf 始终以 NUL 结尾）。 */
+size_t json_appendf(char* buf, size_t cap, size_t off, const char* fmt, ...) {
+  if (off >= cap) {
+    return cap;
+  }
+  va_list ap;
+  va_start(ap, fmt);
+  const int n = vsnprintf(buf + off, cap - off, fmt, ap);
+  va_end(ap);
+  if (n < 0) {
+    return cap;
+  }
+  const size_t next = off + (size_t)n;
+  return next > cap ? cap : next;
+}
+
+/** 拼 radar_state JSON。
+ *  缺失的字段【整个省略】而不是填 0 —— 0 在协议里就是「无效」，填 0 会让
+ *  服务端分不清「没目标 / 测不到」与「值恰好是 0」。 */
+size_t build_uplink_json(char* buf, size_t cap, const radar_snapshot_t& s) {
+  size_t off = json_appendf(buf, cap, 0, "{\"type\":\"radar_state\",\"present\":%s",
+                            s.present ? "true" : "false");
+  if (s.present) {
+    off = json_appendf(buf, cap, off, ",\"x_mm\":%d,\"y_mm\":%d", (int)s.x_mm, (int)s.y_mm);
+  }
+  if (s.heart_rate > 0) {
+    off = json_appendf(buf, cap, off, ",\"heart_rate\":%u", (unsigned)s.heart_rate);
+  }
+  if (s.breath_rate > 0) {
+    off = json_appendf(buf, cap, off, ",\"breath_rate\":%u", (unsigned)s.breath_rate);
+  }
+  off = json_appendf(buf, cap, off, "}");
+  return off;
+}
+
+/** 按 RADAR_UPLINK_INTERVAL_MS 节流上报。每 10ms 调用一次，非阻塞。
+ *  刻意【不】做「内容没变就跳过」：一旦跳过，服务端的整帧 TTL 会把
+ *  「人静坐、数据无变化」误判成「数据过期」。 */
+void maybe_uplink_radar(uint32_t now) {
+  if ((uint32_t)(now - s_last_uplink_ms) < (uint32_t)RADAR_UPLINK_INTERVAL_MS) {
+    return;
+  }
+  s_last_uplink_ms = now;
+
+  const radar_snapshot_t snap = radar_snapshot();
+  char json[192];
+  build_uplink_json(json, sizeof(json), snap);
+  if (ws_transport_enqueue_state(json)) {
+    s_uplink_warned = false;
+    return;
+  }
+  /* 失败限频告警：1Hz 每拍都打会把串口刷满、盖掉真正有用的日志 */
+  if (!s_uplink_warned) {
+    s_uplink_warned = true;
+    log_warn("[RADAR] 状态上行失败（TX 队列满或链路未就绪）；此告警只打一次");
+  }
+}
+#else
+void maybe_uplink_radar(uint32_t /*now*/) {}
+#endif /* DESKBOT_RADAR_UPLINK_ENABLE */
+
 void task_loop_radar(void* /*arg*/) {
   for (;;) {
     const uint32_t now = millis();
@@ -525,6 +632,8 @@ void task_loop_radar(void* /*arg*/) {
     log_events();
     log_summary(now);
     log_silent_diag(now);
+    /* 状态上行放在这里 = WS 门控之后（上面已 continue 掉未连接的情况）。 */
+    maybe_uplink_radar(now);
     vTaskDelay(pdMS_TO_TICKS(kPollIntervalMs));
   }
 }
@@ -534,6 +643,40 @@ void task_loop_radar(void* /*arg*/) {
 /* ──────────────────────────────────────────────────────────────────────
  * 公开接口
  * ──────────────────────────────────────────────────────────────────── */
+
+radar_snapshot_t radar_snapshot() {
+  radar_snapshot_t out{};
+  if (!s_ready) {
+    return out; /* 未 setup_radar()：返回全零（present=false、生命体征未知） */
+  }
+  const uint32_t now = millis();
+
+  /* 「有人在」用不限距离的有效目标数判 —— 与「能不能用来算方位」是两件事：
+   * 人站在 3m 外时仍然「有人」，只是方位窗口（DESKBOT_RADAR_*_DIST_MM）够不着。 */
+  out.present = ld2450_valid_count(ld2450_status(&s_ld2450)) > 0;
+
+  /* 方位：与「说话转向」共用同一个 pick（同窗口、同筛选顺序），
+   * 保证 LLM 说出的方位 = 头实际朝过去的方向。 */
+  const ld2450_target_t* t =
+      pick_ld2450_target(DESKBOT_RADAR_MIN_DIST_MM, DESKBOT_RADAR_MAX_DIST_MM);
+  if (t) {
+    /* 符号规范化：线上契约固定为「负 = 机器人左侧」。
+     * 实测反了（人站左边却报正数）→ 把 radar_config.h 的 DESKBOT_RADAR_X_SIGN 改成 -1。 */
+    out.x_mm = (int16_t)((int)t->x_mm * DESKBOT_RADAR_X_SIGN);
+    out.y_mm = t->y_mm;
+  }
+
+  /* 生命体征：超过 RADAR_VITAL_TTL_MS 没更新 → 保持 0（= 未知），
+   * 而不是把断线/刚开机前的陈旧值当成当前读数发出去。 */
+  const r60_status_t* r = r60_status(&s_r60);
+  if (s_heart_ms != 0 && (uint32_t)(now - s_heart_ms) < (uint32_t)RADAR_VITAL_TTL_MS) {
+    out.heart_rate = r->heart_rate;
+  }
+  if (s_breath_ms != 0 && (uint32_t)(now - s_breath_ms) < (uint32_t)RADAR_VITAL_TTL_MS) {
+    out.breath_rate = r->breath_rate;
+  }
+  return out;
+}
 
 bool setup_radar() {
   if (s_ready) {
