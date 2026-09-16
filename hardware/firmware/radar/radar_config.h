@@ -49,3 +49,54 @@
 #ifndef RADAR_SILENT_WARN_MS
 #define RADAR_SILENT_WARN_MS 5000
 #endif
+
+/* ========== 看人转头（说话时转向说话人，看不见人了回中）==========
+ *
+ * 【转向】触发来自服务端：ASR 识别成功（已过 VAD 切句 + 注意力门控，噪音与
+ * 闲聊都滤掉了）时下发 HEAD_SERVO_LOOK 模式舵机帧，设备按 LD2450 目标算角度。
+ * 为什么不用 ESP-SR VAD 本地触发（试过，已弃用）：
+ *   - VAD 是「音量」判据 → 噪音/电视会误触
+ *   - VAD 只在 silence→speech 跳变时产生事件 → 话说快了（间隔 <256ms 确认窗）
+ *     就没有新事件 → 漏触发（表现为「时灵时不灵」）
+ * 服务端的 ASR 成功事件两个毛病都没有，语义上等价于上游的唤醒词。
+ *
+ * 【回中】用 LD2450「看不见人了」判据，**不用 R60 的 presence**：
+ *   R60 报「有人→无人」要 ~40s 才上报 → 回中会拖到下一次对话时才落地，
+ *   和新的 LOOK 抢同一个舵机（实测表现为「有时只回正不转向」「有时转后不回正」）。
+ *   LD2450 是 10Hz，反应快，且语义一致 —— 看不见人 → 看回正前方。
+ *
+ * 纯本地功能，刻意放在 ws_transport_ready() 门控【之前】—— 断网时依然可用。
+ */
+
+/* 总开关：置 0 关闭。 */
+#ifndef DESKBOT_LOOK_ENABLE
+#define DESKBOT_LOOK_ENABLE 1
+#endif
+
+/* 平滑转动时长（ms）。400ms 转满 180° ≈ 450°/s，偏快；舵机有噪声就调大。 */
+#ifndef DESKBOT_LOOK_MS
+#define DESKBOT_LOOK_MS 400
+#endif
+
+/* 方位角 → 舵机角度增益。1.0 = 雷达转 1° 舵机也转 1°。
+ * ⚠️ x_mm 的符号方向取决于雷达实际装配朝向：若实测「人在左边却往右转」，
+ *    改成 -1.0f 重新烧录即可。 */
+#ifndef DESKBOT_LOOK_GAIN
+#define DESKBOT_LOOK_GAIN 1.0f
+#endif
+
+/* 回中判据（ms）：LD2450 连续这么久看不到任何目标 → 平滑转回中位。
+ * 调大 = 更不容易「人还坐着但雷达暂时丢了」就转回去；调小 = 回中更快。
+ * 置 0 = 关闭自动回中（转过头就一直停在那个角度，直到下次说话）。 */
+#ifndef DESKBOT_LOOK_RECENTER_QUIET_MS
+#define DESKBOT_LOOK_RECENTER_QUIET_MS 8000
+#endif
+
+/* 目标距离筛选（mm）：超出 MAX 视为无目标（与摘要日志同口径）；
+ * 小于 MIN 视为贴脸噪声 —— 近距离时 atan2 会剧烈跳变。 */
+#ifndef DESKBOT_LOOK_MIN_DIST_MM
+#define DESKBOT_LOOK_MIN_DIST_MM 200
+#endif
+#ifndef DESKBOT_LOOK_MAX_DIST_MM
+#define DESKBOT_LOOK_MAX_DIST_MM 3000
+#endif

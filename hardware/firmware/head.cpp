@@ -55,18 +55,26 @@ enum class MotorJobType : uint8_t {
   kCancel = 0,
   kPbServoChunk = 2,
   kEndOfTask = 3,
+  /** 本地（非 pb）单条舵机指令：纯 POD、无堆所有权、不碰 s_task_done。
+   *  供 VAD 转头等本地功能使用 —— 走 pb 的 kPbServoChunk 会置 s_task_done=false，
+   *  与 pb_runtime 的末窗口等待存在竞态（可致 120s 超时）。 */
+  kLocalServo = 4,
 };
 
 struct MotorJob {
   MotorJobType type = MotorJobType::kPbServoChunk;
   pb_servo_frame* servo_frames = nullptr;
   size_t servo_count = 0;
+  MotorCmd local{};  /* kLocalServo 用；无所有权，直接内联 */
 };
 
 QueueHandle_t s_motor_queue = nullptr;
 TaskHandle_t  s_motor_task  = nullptr;
 std::atomic<bool> s_need_cancel{false};
 static std::atomic<bool> s_task_done{true};
+
+/** 「看向人」目标角提供者（radar 模块注册）；nullptr = LOOK 模式不可用。 */
+int (*s_look_angle_provider)(void) = nullptr;
 
 static void free_motor_job(MotorJob& job) {
   if (job.type == MotorJobType::kPbServoChunk) {
@@ -105,9 +113,35 @@ static bool poll_cancel() {
 }
 
 /** @return false 若中途 need_cancel。仅时间预算模式（ms > 0）。 */
+/** LOOK 模式：向 radar 模块索取目标角。无目标/未注册 → HEAD_LOOK_ANGLE_NONE。
+ *
+ *  ⚠️ 这里刻意**不做**「已在位就不动」的死区判断（曾经有 `< 3°` 的版本，已删）：
+ *     转过去的角度还没回中、人又站在同一位置时，新 LOOK 算出的目标角与当前角
+ *     几乎相同 → 被判成「已在位」→ 整个转向被吞掉（表现为「有时不转向」）。
+ *     代价是目标角与当前角相同时也走一次 no-op 插值，但 LOOK 每轮 ASR 只下发
+ *     一次，这点开销无关紧要。 */
+static int resolve_look_target() {
+  if (!s_look_angle_provider) {
+    return HEAD_LOOK_ANGLE_NONE;
+  }
+  const int deg = s_look_angle_provider();
+  if (deg == HEAD_LOOK_ANGLE_NONE) {
+    return HEAD_LOOK_ANGLE_NONE;
+  }
+  return constrain(deg, X_MIN_LIMIT, X_MAX_LIMIT);
+}
+
 static bool execute_motor_cmd(const MotorCmd& cmd) {
   if (cmd.ms <= 0) return true;
-  const int x_target = resolve_target(cmd.xm, s_logical_x, cmd.x, X_MIN_LIMIT, X_MAX_LIMIT);
+  int x_target;
+  if (cmd.xm == HEAD_SERVO_LOOK) {
+    x_target = resolve_look_target();
+    if (x_target == HEAD_LOOK_ANGLE_NONE) {
+      return true; /* 无目标或已在位：当作已完成，不占用插值时间 */
+    }
+  } else {
+    x_target = resolve_target(cmd.xm, s_logical_x, cmd.x, X_MIN_LIMIT, X_MAX_LIMIT);
+  }
   const int y_target = resolve_target(cmd.ym, s_logical_y, cmd.y, Y_MIN_LIMIT, Y_MAX_LIMIT);
 
   const int x_start = s_logical_x, y_start = s_logical_y;
@@ -159,12 +193,17 @@ static void task_loop_motor(void* /*arg*/) {
       s_task_done.store(true, std::memory_order_release);
       continue;
     }
+    if (job.type == MotorJobType::kLocalServo) {
+      /* 本地单条指令：不需要 free_motor_job（无堆所有权） */
+      (void)execute_motor_cmd(job.local);
+      continue;
+    }
     /* kPbServoChunk：逐帧执行，任意帧被 cancel 则中断本 chunk。 */
     if (job.servo_frames && job.servo_count > 0) {
       for (size_t i = 0; i < job.servo_count; ++i) {
         const pb_servo_frame& f = job.servo_frames[i];
         MotorCmd cmd{};
-        cmd.xm = (uint8_t)constrain(f.xm, 0, 2);
+        cmd.xm = (uint8_t)constrain(f.xm, 0, 3); /* 3 = HEAD_SERVO_LOOK */
         cmd.ym = (uint8_t)constrain(f.ym, 0, 2);
         cmd.x  = f.x;
         cmd.y  = f.y;
@@ -219,6 +258,30 @@ void head_submit_pb_servo_chunk_owned(pb_servo_frame* frames, size_t count) {
     return;
   }
   log_info("[HEAD] pb servo[] submitted segs=%u", (unsigned)count);
+}
+
+void head_set_look_angle_provider(int (*fn)(void)) {
+  s_look_angle_provider = fn;
+}
+
+bool head_move_x_abs(int deg, uint16_t ms) {
+  /* 队列由 task_setup_head() 建；它晚于 task_setup_radar()，所以开机早期
+   * 调用会走到这里 → 返回 false 而不是在 NULL 队列上 xQueueSend。 */
+  if (!s_motor_queue) {
+    return false;
+  }
+  MotorJob job{};
+  job.type = MotorJobType::kLocalServo;
+  job.local.xm = HEAD_SERVO_ABS;   /* 绝对角度 */
+  job.local.ym = HEAD_SERVO_HOLD;  /* 只动 X，Y 保持（本板 Y 也未接） */
+  job.local.x  = deg;
+  job.local.y  = 0;
+  job.local.ms = (ms > 0) ? ms : (uint16_t)SERVO_TICK_MS;
+  if (xQueueSend(s_motor_queue, &job, 0) != pdTRUE) {
+    log_warn("[HEAD] local move queue full; drop deg=%d", deg);
+    return false;
+  }
+  return true;
 }
 
 /* ---- 初始化 ---- */

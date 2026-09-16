@@ -255,6 +255,57 @@ async def _send_servo_moves(
     return delivered
 
 
+# ── 转向说话人（ASR 成功后）──────────────────────────────────────────────
+# 舵机模式位，与固件 head.h 的 HEAD_SERVO_* / 服务端 PbServo 对齐。
+_SERVO_MODE_HOLD = 2
+# HEAD_SERVO_LOOK：X 轴目标角不由服务端给，而是设备运行时向自己的雷达模块索取。
+# 服务端不知道 LD2450 坐标，只发这个模式位表示「看向说话人」。
+_SERVO_MODE_LOOK = 3
+_LOOK_TURN_MS = 400
+
+
+async def send_look_at_speaker(device_ws: DeviceWsService, device_id: str) -> int:
+    """ASR 识别成功后，让设备转向说话人。
+
+    下发一个 ``HEAD_SERVO_LOOK``（xm=3）的纯舵机片；设备收到后回调自己的
+    LD2450 方位角提供者，算出目标角并平滑转过去。
+
+    ⚠️ 刻意绕过 ``expand_llm_moves`` / ``clamp_servo_step`` —— 它们会把 xm 归一到
+       0/1（见 ``servo_config_store.logical_step_to_protocol``），模式位会被吃掉。
+       所以这里直接构造 wire 帧。
+
+    ``level=IDLE``：不抢占正在播放的口播 —— 转向是锦上添花，不该打断说话。
+    """
+    dev = str(device_id or "").strip()
+    if not dev:
+        return 0
+    from deskbot_server.model.pb_seq import PbBlock, PbSeq
+
+    req_id = uuid.uuid4().hex[:16]
+    wire = {
+        "type": "pb_single",
+        "req": req_id,
+        "idx": 0,
+        "chunk_ms": _LOOK_TURN_MS,
+        "pb_ver": 2,
+        "action": PB_ACTION_REPLACE,
+        "level": PB_LEVEL_IDLE,
+        "servo": [
+            {
+                "xm": _SERVO_MODE_LOOK,  # 转向雷达方位角（角度由设备侧算）
+                "ym": _SERVO_MODE_HOLD,  # Y 轴保持不动
+                "x": 0,
+                "y": 0,
+                "ms": _LOOK_TURN_MS,
+            }
+        ],
+    }
+    pb_seq = PbSeq(req=req_id, entries=(PbBlock.from_wire(wire),), level=PB_LEVEL_IDLE)
+    delivered = await device_ws.send(dev, pb_seq)
+    logger.info("[look] 转向说话人 device_id=%s req=%s delivered=%d", dev, req_id, delivered)
+    return delivered
+
+
 async def maybe_send_listen_feedback(device_ws: DeviceWsService, device_id: str) -> None:
     """收音开始时：有效人脸则注视，否则左右巡查（2s）；同类动作间隔 ≥5s。"""
     if not get_auto_reply(device_id) or _face_follow_active(device_id):

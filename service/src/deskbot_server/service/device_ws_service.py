@@ -1287,6 +1287,17 @@ class DeviceWsService(metaclass=SingletonMeta):
             logger.warning("[turn] 被新语音打断（LLM 前），放弃本轮 req=%s", request_id)
             return
 
+        # 转向说话人：ASR 已成功且过了注意力门控 —— 语义上等价于上游的唤醒词
+        # （噪音、无关闲聊都已被滤掉）。只下发模式位，角度由设备用自己的 LD2450 算。
+        try:
+            from deskbot_server.service.application.interaction_feedback import (
+                send_look_at_speaker,
+            )
+
+            await send_look_at_speaker(self, device_id or "")
+        except Exception:
+            logger.warning("[look] 转向下发失败（忽略，不影响本轮）", exc_info=True)
+
         try:
             flow = await run_ws_chat_turn(
                 websocket,

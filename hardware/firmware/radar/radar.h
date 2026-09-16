@@ -69,6 +69,14 @@
  *   转头跟随 —— 用 atan2(x, y) 求水平方位角；上游做法会忽略 3m 以外的目标。
  *   挥手检测 —— 观察 x 的符号翻转配合速度变化。
  *
+ * ⚠️ 本板已实现「说话时转向说话人」：ASR 识别成功后，服务端下发一个
+ *    HEAD_SERVO_LOOK 模式位（角度由设备按上述方位角自己算），见 radar.cpp 的
+ *    look_angle_provider()；LD2450 连续 DESKBOT_LOOK_RECENTER_QUIET_MS 看不见
+ *    人则自动回中，见 maybe_recenter()。开关与阈值见 radar_config.h 的
+ *    DESKBOT_LOOK_*。
+ *    （触发信号曾用 ESP-SR VAD —— 噪音误触 + 快说漏触发；回中曾用 R60 的
+ *      presence —— 上报延迟 ~40s，会拖到下一次对话才落地。两者均已弃用。）
+ *
  * 注：日志里的 x/y 已由驱动的 mm 换算成 cm。
  */
 

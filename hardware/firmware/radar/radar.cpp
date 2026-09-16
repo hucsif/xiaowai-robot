@@ -7,12 +7,14 @@
 #include "squat_fsm.h"
 #include "wave_fsm.h"
 
+#include "head.h"
 #include "logger.h"
 #include "utils/utils.h"
 #include "ws_transport.h"
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -277,15 +279,23 @@ void on_r60_frame(uint8_t ctl, uint8_t cmd, const uint8_t* /*data*/, uint16_t /*
 }
 
 /** LD2450 帧回调：取第一个有效且在 3m 内的目标喂挥手 FSM。 */
-void on_ld2450_frame(const ld2450_target_t* targets, int count, void* /*user*/) {
-  const uint32_t now = millis();
-  const ld2450_target_t* pick = nullptr;
-  for (int i = 0; i < count; ++i) {
-    if (targets[i].valid && targets[i].y_mm > 0 && targets[i].y_mm < 3000) {
-      pick = &targets[i];
-      break;
+/** 从当前 LD2450 快照里挑第一个「有效、且在距离窗口内」的目标。
+ *  喂 wave/squat 与 VAD 转头共用同一口径（后者窗口更严，见 radar_config.h）。 */
+const ld2450_target_t* pick_ld2450_target(int16_t min_dist_mm, int16_t max_dist_mm) {
+  const ld2450_status_t* l = ld2450_status(&s_ld2450);
+  for (int i = 0; i < LD2450_TARGET_COUNT; ++i) {
+    const ld2450_target_t& t = l->targets[i];
+    if (t.valid && t.y_mm > min_dist_mm && t.y_mm < max_dist_mm) {
+      return &t;
     }
   }
+  return nullptr;
+}
+
+void on_ld2450_frame(const ld2450_target_t* /*targets*/, int /*count*/, void* /*user*/) {
+  const uint32_t now = millis();
+  /* 快照在回调前已按本帧更新完毕，等价于直接读入参 */
+  const ld2450_target_t* pick = pick_ld2450_target(0, 3000);
   if (pick) {
     wave_on_frame(&s_wave, true, pick->x_mm, pick->y_mm, pick->speed_cms, now);
 
@@ -362,9 +372,119 @@ void resume_from_pause(uint32_t now) {
   s_prev_stage = -1;
 }
 
+/* ──────────────────────────────────────────────────────────────────────
+ * 看向人（配置见 radar_config.h 的 DESKBOT_LOOK_*）
+ *
+ * 【转向】触发来自服务端：ASR 识别成功（已过 Silero VAD 切句 + 注意力门控，
+ * 噪音与闲聊都滤掉了）时，服务端下发一个 HEAD_SERVO_LOOK 模式的舵机帧；
+ * 设备收到后由本文件的 look_angle_provider() 按 LD2450 当前目标算出目标角。
+ *
+ * 为什么不本地触发（ESP-SR VAD 试过，已弃用）：
+ *   - VAD 是音量判据 → 噪音/电视会误触
+ *   - VAD 只在 silence→speech 跳变时产生事件 → 话说快了（间隔 <256ms 确认窗）
+ *     就没有新事件 → 漏触发（表现为「时灵时不灵」）
+ * 服务端的 ASR 成功事件两个毛病都没有，语义上等价于上游的唤醒词。
+ *
+ * 【回中】走本地，判据是 LD2450「看不见人了」，**不是 R60 的 presence**。
+ * R60 报「有人→无人」要 ~40s 才上报，回中会拖到下一次对话才落地、和新的
+ * LOOK 抢舵机（实测就是「有时只回正不转向 / 有时转后不回正」）。
+ * ──────────────────────────────────────────────────────────────────── */
+
+#if DESKBOT_LOOK_ENABLE
+/** 最近一次「LD2450 还看得见人」的时刻 —— 回中的计时锚点。
+ *  只由 note_ld2450_target_seen() 刷新，且该函数只在 WS 已连接、解析器在跑的
+ *  时候被调用 —— 断网期间锚点自然变陈旧，头会自动回中，符合直觉。 */
+uint32_t s_look_last_seen_ms = 0;
+/** 上一次提交回中的时刻。回中被 pb cancel 吃掉后靠它限流重发（不堆队列）。 */
+uint32_t s_look_recenter_ms = 0;
+
+/** 两次回中提交的最小间隔：上一次的 400ms 还没走完就别再塞队列。 */
+constexpr uint32_t kRecenterRetryMs = 300;
+
+/** LD2450 当前是否有任何有效目标（**不限距离**）—— 只回答「人还在不在」。
+ *  与 look_angle_provider() 的距离窗口刻意不同：那边是「能不能用来算角度」，
+ *  这边是「人在不在」，站远一点也算在。 */
+bool ld2450_has_any_target() {
+  const ld2450_status_t* l = ld2450_status(&s_ld2450);
+  for (int i = 0; i < LD2450_TARGET_COUNT; ++i) {
+    if (l->targets[i].valid) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** 刷新回中锚点。task_loop_radar 每 10ms 调一次（仅 WS 已连接的活跃路径）。 */
+void note_ld2450_target_seen(uint32_t now) {
+  if (ld2450_has_any_target()) {
+    s_look_last_seen_ms = now;
+  }
+}
+
+/** 「看向人」目标角提供者，注册给 head（head_set_look_angle_provider）。
+ *  服务端下发 LOOK 模式时由 motor 任务调用。
+ *  @return 已 constrain 的舵机目标角；无可用目标时 HEAD_LOOK_ANGLE_NONE。
+ *  ⚠️ 这里**不做**「和目标角一样就不动」的死区判断 —— 那个死区曾导致
+ *     「上次转过去的角度还没回中 + 人站在原地」时新 LOOK 被整个吞掉。
+ *     去重由 head.cpp 的 resolve_look_target() 之外无第二处，这里只管算角度。 */
+int look_angle_provider() {
+  const ld2450_target_t* t =
+      pick_ld2450_target(DESKBOT_LOOK_MIN_DIST_MM, DESKBOT_LOOK_MAX_DIST_MM);
+  if (!t) {
+    log_warn("[LOOK] 服务端请求转向，但 LD2450 无可用的目标");
+    return HEAD_LOOK_ANGLE_NONE;
+  }
+  const float bearing = atan2f((float)t->x_mm, (float)t->y_mm) * 180.0f / (float)M_PI;
+  if (!isfinite(bearing)) {
+    return HEAD_LOOK_ANGLE_NONE;
+  }
+  const int deg = constrain(X_CENTER + (int)lroundf(bearing * DESKBOT_LOOK_GAIN),
+                            X_MIN_LIMIT, X_MAX_LIMIT);
+  log_warn("[LOOK] 转向说话人 → x=%d,y=%d mm 方位=%.1f° 舵机=%d°",
+           (int)t->x_mm, (int)t->y_mm, (double)bearing, deg);
+  return deg;
+}
+
+/** LD2450 连续 DESKBOT_LOOK_RECENTER_QUIET_MS 看不见人 → 平滑回中。
+ *  每 10ms 调用一次，非阻塞。
+ *
+ *  判「是否已转过头」用的是 head_read_x()（当前目标角）而不是布尔标志，所以
+ *  回中被后续 pb 链 cancel 掉（poll_cancel() 会丢弃本地队列项）时，只要角度
+ *  还没到中位就会被重新提交 —— 自愈，不会像边沿触发那样一次性永久丢失。 */
+void maybe_recenter(uint32_t now) {
+#if DESKBOT_LOOK_RECENTER_QUIET_MS > 0
+  if ((uint32_t)(now - s_look_last_seen_ms) < (uint32_t)DESKBOT_LOOK_RECENTER_QUIET_MS) {
+    return; /* 刚刚还看得见人 */
+  }
+  if (head_read_x() == X_CENTER) {
+    return; /* 已经在正前方 */
+  }
+  if ((uint32_t)(now - s_look_recenter_ms) < (uint32_t)(DESKBOT_LOOK_MS + kRecenterRetryMs)) {
+    return; /* 上一次回中还在进行 / 刚提交 */
+  }
+  if (head_move_x_abs(X_CENTER, DESKBOT_LOOK_MS)) {
+    s_look_recenter_ms = now;
+    log_warn("[LOOK] LD2450 已 %lus 看不见人 → 回中 %d°",
+             (unsigned long)((now - s_look_last_seen_ms) / 1000u), X_CENTER);
+  }
+#else
+  (void)now;
+#endif
+}
+#endif /* DESKBOT_LOOK_ENABLE */
+
 void task_loop_radar(void* /*arg*/) {
   for (;;) {
     const uint32_t now = millis();
+
+    /* 回中：LD2450 长时间看不见人 → 转回中位。纯本地，放在 WS 门控之前。
+     * 转向说话人由服务端在 ASR 成功时下发 HEAD_SERVO_LOOK 触发（见下方
+     * look_angle_provider 的注册）。
+     * 锚点 note_ld2450_target_seen() 只在下面活跃路径里刷新，所以断网期间
+     * 锚点会变陈旧 → 头自动回中，正是我们想要的。 */
+#if DESKBOT_LOOK_ENABLE
+    maybe_recenter(now);
+#endif
 
     /* 未连上 service 时完全静默：不解析、不检测、不输出日志。
      * UART 硬件照常收进 ring，这里只排空丢弃防止溢出。
@@ -389,6 +509,11 @@ void task_loop_radar(void* /*arg*/) {
     drain_r60(now);
     drain_ld2450(now);
     update_liveness(now);
+
+#if DESKBOT_LOOK_ENABLE
+    /* 看得见人就刷新回中锚点（maybe_recenter 在上方、WS 门控之前）。 */
+    note_ld2450_target_seen(now);
+#endif
 
     /* 入座/离座是 tick 驱动（另有 squat/wave 在帧回调里事件驱动） */
     if ((uint32_t)(now - s_last_seat_tick) >= kSeatTickMs) {
@@ -426,6 +551,12 @@ bool setup_radar() {
   squat_init(&s_squat, nullptr, on_squat_event, nullptr);
   wave_init(&s_wave, nullptr, on_wave_event, nullptr);
   seat_init(&s_seat, nullptr, on_seat_event, nullptr);
+
+#if DESKBOT_LOOK_ENABLE
+  /* 注册「看向人」目标角提供者：服务端下发 HEAD_SERVO_LOOK 模式时，motor 任务
+   * 会回调 look_angle_provider() 按当时的 LD2450 目标算角度。 */
+  head_set_look_angle_provider(look_angle_provider);
+#endif
 
   /* RX ring 默认仅 256B。日志出口（USB CDC）在主机遇忙时可能阻塞较久，
    * 消费停顿期间靠 ring 兜住；提到 1024B 留足余量。必须在 begin() 之前设置。 */
