@@ -33,6 +33,7 @@ from deskbot_server.service.application.llm_error_fallback import (
     stop_llm_error_motion_feedback,
 )
 from deskbot_server.service.application.llm_tool_runner import execute_llm_tools
+from deskbot_server.constants import TOOL_INTERIM_TTS_ENABLED
 from deskbot_server.service.application.tool_interim_tts import resolve_interim_tts
 from deskbot_server.utils.util import _ms_between
 
@@ -559,7 +560,9 @@ async def complete_llm_with_tool_loop(
             all_tool_results.extend(tool_results)
             # 「边干活边说」：过渡语后台播报，工具执行与 TTS 合成并行推进，
             # 不占用本轮的端到端延迟；每轮最多一句，round 2+ 模型已看不见 say。
-            if on_interim_tts_play is not None and not interim_spoken:
+            # TOOL_INTERIM_TTS_ENABLED=0 时整块跳过（每轮只说最终答案，
+            # interim_spoken 保持 False 无副作用 —— 它只用于「每轮最多一句」）。
+            if TOOL_INTERIM_TTS_ENABLED and on_interim_tts_play is not None and not interim_spoken:
                 say_text = next(
                     (str(r.get("reply") or "") for r in tool_results
                      if str(r.get("tool") or "") == "say" and r.get("ok")),

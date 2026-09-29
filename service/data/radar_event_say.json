@@ -1,0 +1,14 @@
+{
+  "wave": {
+    "enabled": true,
+    "text": "你好呀！"
+  },
+  "seated": {
+    "enabled": true,
+    "text": "你回来啦～"
+  },
+  "away": {
+    "enabled": true,
+    "text": "那我先歇会儿，需要我就叫我。"
+  }
+}

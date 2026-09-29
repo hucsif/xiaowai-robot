@@ -125,9 +125,20 @@ websocket_connect(url);
 
 | `type` | 说明 |
 |--------|------|
+| `radar_event` | 动作事件即时上报，**事件驱动**（非周期）。`{"type":"radar_event","event":"wave"｜"seated"｜"away"}` |
 | `ping` | 服务端回 `pong` |
 | `pb_ack` | 播放回压，见 §8 |
 | `user_text` | 调试：跳过 ASR |
+
+**`radar_event` 的语义**：挥手 / 入座 / 离座三个动作各触发一条。服务端收到后
+**直接 TTS 合成 → 组 pb 下发一句预设台词**（`service/application/radar_event_say.py`），
+**不走 LLM** —— 固定场景的寒暄没必要多一次 LLM 往返，也避免模型说成「我检测到你入座了」。
+逐项开关与台词在 **`data/radar_event_say.json`**（首次运行自动生成，改完**不用重启**）：
+`{"wave": {"enabled": true, "text": "你好呀！"}, …}`。
+`RADAR_EVENT_SAY_ENABLED`（`.env`）是总闸，与文件里的逐项开关是两级关系。
+
+事件来源与判据见固件 `radar/wave_fsm.c`（LD2450 挥手）与 `radar/seat_fsm.c`（R60 入座/离座）；
+上行开关 `DESKBOT_RADAR_EVENT_UPLINK_ENABLE`（`radar/radar_config.h`）。
 
 **示例顺序**
 

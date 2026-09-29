@@ -11,7 +11,7 @@
 
 void wave_default_config(wave_config_t *c)
 {
-    c->event_min       = 8;
+    c->event_min       = 10;
     c->hold_ms         = 3000;
     c->speed_threshold = 8;
 }

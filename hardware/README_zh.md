@@ -55,6 +55,8 @@
 
 两路雷达（R60ABD1 呼吸睡眠 + LD2450 运动追踪）除了打串口日志，还会按 1Hz 把一份快照上行给服务端（`radar_state`：心率/呼吸/人的方位），供 LLM 的 `get_heart_rate` / `get_breath_rate` / `get_radar_position` 工具读取——**上行不触发任何对话**。开关与周期见 [`firmware/radar/radar_config.h`](firmware/radar/radar_config.h) 的 `DESKBOT_RADAR_UPLINK_ENABLE` / `RADAR_UPLINK_INTERVAL_MS`；心率属健康类敏感信息，不想外发就置 0。
 
+检测到的**动作事件**（挥手 / 入座 / 离座）还会**即时**额外上报一条 `radar_event`，服务端收到后直接合成一句固定台词播出来（**不走 LLM**）。事件的判据见 [`firmware/radar/wave_fsm.c`](firmware/radar/wave_fsm.c)（LD2450 挥手）与 [`firmware/radar/seat_fsm.c`](firmware/radar/seat_fsm.c)（R60 入座/离座）；上行开关 `DESKBOT_RADAR_EVENT_UPLINK_ENABLE`。
+
 Arduino 3.x 的 WiFi write timeout 补丁优先改 `NetworkClient.cpp`（见 `scripts/`）。
 
 ---

@@ -12,7 +12,7 @@
 
 void squat_default_config(squat_config_t *c)
 {
-    c->squat_move_min       = 40;
+    c->squat_move_min       = 80;
     c->squat_xy_max_cm      = 15;
     c->squat_high_count_min = 2;
     c->squat_hold_ms        = 3000;

@@ -147,3 +147,15 @@
 #ifndef DESKBOT_RADAR_X_SIGN
 #define DESKBOT_RADAR_X_SIGN 1
 #endif
+
+/* ---- 动作事件即时上行（挥手 / 入座 / 离座 → 服务端说一句固定台词）----
+ * 与上面 1Hz 的 radar_state 不同：这里是**事件驱动、即时发一条**，用
+ * radar_event 类型（见 radar.cpp 的 uplink_radar_event）：
+ *   {"type":"radar_event","event":"wave"|"seated"|"away"}
+ * 服务端收到后直接 TTS + 组 pb 下发一句预设台词，**不过 LLM**。
+ *
+ * 与 radar_state 共用约定：只在 ws_transport_ready() 的活跃路径上发
+ * （回调本身就在那条路径里），断线时直接丢 —— enqueue_state 不自查链路。 */
+#ifndef DESKBOT_RADAR_EVENT_UPLINK_ENABLE
+#define DESKBOT_RADAR_EVENT_UPLINK_ENABLE 1
+#endif

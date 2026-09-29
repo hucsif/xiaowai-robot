@@ -1059,6 +1059,29 @@ class DeviceWsService(metaclass=SingletonMeta):
                                 note_uplink_radar(device_id)
                             continue
 
+                        if msg_type == "radar_event":
+                            # 动作事件（挥手 / 入座 / 离座）→ 说一句固定台词。
+                            # **不过 LLM**：直接 TTS 合成 + 组 pb 下发，见 radar_event_say。
+                            # spawn 而不 await —— TTS 要几百 ms，不能卡住 WS 接收循环
+                            # （同一条连接上还有音频帧要收）。
+                            from deskbot_server.service.application.radar_event_say import (
+                                say_radar_event_line,
+                            )
+
+                            event = str(data.get("event") or "").strip()
+                            if event and device_id:
+                                spawn(
+                                    say_radar_event_line(
+                                        self,
+                                        device_id,
+                                        event,
+                                        chat=pipeline,
+                                        bus_service=self.bus_service,
+                                    ),
+                                    name="radar_event_say",
+                                )
+                            continue
+
                         logger.debug("[/asr_chat] 未知打包帧 type=%r device_id=%s", msg_type, device_id)
                         continue
 

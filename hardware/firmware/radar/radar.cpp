@@ -335,17 +335,48 @@ void on_ld2450_frame(const ld2450_target_t* /*targets*/, int /*count*/, void* /*
   }
 }
 
-/** 事件回调：当前只打日志；后续可接舵机（head.h）/ 表情（display.h）/ 上报。 */
+/** 动作事件即时上行：交给 service 说一句固定台词（服务端 TTS，不过 LLM）。
+ *
+ *  与 1Hz 的 radar_state 分开：这是**一次性事件**。
+ *  调用点都在 task_loop_radar 的 ws_transport_ready() 门控【之内】
+ *  （挥手来自 drain_ld2450 → on_ld2450_frame；入座/离座来自 seat_tick），
+ *  这里再显式判一次，断线时直接丢 —— enqueue_state 不像 enqueue_audio
+ *  那样自查链路，发了只会堆满 32 深的 TX 队列再被丢。 */
+void uplink_radar_event(const char* event) {
+#if DESKBOT_RADAR_EVENT_UPLINK_ENABLE
+  if (!ws_transport_ready()) {
+    return;
+  }
+  char json[64];
+  snprintf(json, sizeof(json), "{\"type\":\"radar_event\",\"event\":\"%s\"}", event);
+  if (!ws_transport_enqueue_state(json)) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      log_warn("[RADAR] 事件上行失败（TX 队列满或链路未就绪）；此告警只打一次");
+    }
+  }
+#else
+  (void)event;
+#endif
+}
+
+/** 事件回调：打日志 + 把动作事件即时上报（服务端负责说那固定的一句）。 */
 void on_squat_event(squat_event_t ev, int data, void* /*user*/) {
   log_warn("[RADAR/SQUAT] %s body_move=%d", ev == SQUAT_EV_DETECTED ? "蹲下" : "结束", data);
 }
 
 void on_wave_event(wave_event_t ev, int data, void* /*user*/) {
   log_warn("[RADAR/WAVE] %s events=%d", ev == WAVE_EV_DETECTED ? "挥手" : "结束", data);
+  /* 只报「检测到」；ENDED 是 hold_ms 静默后的收尾，不该再触发一次说话 */
+  if (ev == WAVE_EV_DETECTED) {
+    uplink_radar_event("wave");
+  }
 }
 
 void on_seat_event(seat_event_t ev, int data, void* /*user*/) {
   log_warn("[RADAR/SEAT] %s body_move=%d", ev == SEAT_EV_SEATED ? "入座" : "离座", data);
+  uplink_radar_event(ev == SEAT_EV_SEATED ? "seated" : "away");
 }
 
 /* ──────────────────────────────────────────────────────────────────────

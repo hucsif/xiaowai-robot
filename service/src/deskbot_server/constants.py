@@ -33,6 +33,33 @@ BARGE_IN_ENABLED = os.environ.get("BARGE_IN_ENABLED", "1").strip().lower() not i
     "no",
     "off",
 )
+
+# 工具轮「过渡语」：一轮里 LLM 要调工具（查天气/查方位…）时，先播一句垫场话
+# （「我想一下啊。」「我帮你查一下天气」），盖住等 LLM + TTS 的干等。
+# 0 = 关掉：每轮只说最终答案，不会多嘴；代价是工具轮会有数秒完全沉默
+# （本地 LLM 延迟约 4~6s 时尤其明显）。非工具轮本来就没有过渡语，不受影响。
+TOOL_INTERIM_TTS_ENABLED = os.environ.get("TOOL_INTERIM_TTS_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+# 雷达动作事件（挥手 / 入座 / 离座）→ 说一句固定台词。
+# 台词与实现在 service/application/radar_event_say.py，**不过 LLM**（直接 TTS + 组 pb）。
+# 0 = 完全不说（事件仍会上行，只是丢弃）。
+RADAR_EVENT_SAY_ENABLED = os.environ.get("RADAR_EVENT_SAY_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+# 同一设备、同一类事件的最小说话间隔（秒）。
+# 挥手 FSM 判据较松（x 跨零无阈值），虽然它自己要求累积 10 次事件 + 3s 静默，
+# 这里再加一道兜底，避免连挥几次就念叨几句。
+RADAR_EVENT_SAY_COOLDOWN_SEC = max(0.0, float(os.environ.get("RADAR_EVENT_SAY_COOLDOWN_SEC", "5.0")))
+# 每类事件的开关与台词（挥手/入座/离座）。首次读取时自动生成一份默认文件。
+RADAR_EVENT_SAY_FILE = str(DATA_DIR / "radar_event_say.json")
 # ESP32 打包帧 JSON 上限（字节）；与固件 DESKBOT_MAX_PACKED_JSON_LEN 对齐
 PB_MAX_WIRE_JSON_BYTES = max(4096, int(os.environ.get("PB_MAX_WIRE_JSON_BYTES", str(64 * 1024))))
 # ESP32 WS 单帧 BINARY（PCM）上限；默认按 10s@16kHz mono s16le（统一下发采样率，10000ms→320000B）
